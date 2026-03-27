@@ -890,7 +890,9 @@ async function generateModelShot(images, scene, ai) {
         '- Avoid flat, shadowless, "product listing" lighting',
         '',
         'COMPOSITION:',
-        '- Frame it like a real photographer would: rule of thirds, slight negative space, the jewelry at a natural visual anchor point',
+        '- Frame TIGHT on the jewelry — it should fill at least 40-50% of the image area. Crop in close so every detail is clearly visible',
+        '- Use a close-up or macro-style framing: the jewelry and the body part wearing it (hand, neck, ear, wrist) should dominate the frame',
+        '- Minimal negative space — do NOT pull back to show full body or wide scenery',
         '- Slight depth compression typical of a telephoto portrait lens — background elements slightly enlarged relative to subject',
         '- Background should have genuine optical bokeh with slight chromatic fringing at high-contrast edges, not gaussian blur',
         '',
@@ -929,9 +931,9 @@ async function generateModelShot(images, scene, ai) {
         config: { responseModalities: ['TEXT', 'IMAGE'] },
     };
 
-    // Retry up to 3 times — abort after 90s per attempt to avoid Gemini hanging
-    const GEMINI_TIMEOUT_MS = 90_000;
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    // Retry up to 2 times — abort after 60s per attempt to avoid Gemini hanging
+    const GEMINI_TIMEOUT_MS = 60_000;
+    for (let attempt = 1; attempt <= 2; attempt++) {
         try {
             const response = await ai.models.generateContent({
                 ...requestPayload,
@@ -945,7 +947,7 @@ async function generateModelShot(images, scene, ai) {
             if (imagePart) return addWatermark(imagePart.inlineData.data);
             console.log(`[Gemini] No image on attempt ${attempt} — retrying...`);
         } catch (err) {
-            if (attempt < 3) {
+            if (attempt < 2) {
                 const isTimeout = err.name === 'AbortError';
                 const delay = isTimeout ? 2000 : attempt * 5000;
                 console.log(`[Gemini] ${isTimeout ? 'Timeout' : 'Error'} on attempt ${attempt} (${err.message}) — retrying in ${delay / 1000}s...`);
@@ -955,7 +957,7 @@ async function generateModelShot(images, scene, ai) {
             }
         }
     }
-    throw new Error('Gemini returned no image after 3 attempts');
+    throw new Error('Gemini returned no image after 2 attempts');
 }
 
 // ── Export as Firebase Cloud Function ─────────────────────────────────────────

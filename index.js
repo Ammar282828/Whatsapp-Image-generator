@@ -175,11 +175,11 @@ async function generateModelShot(base64Image, mimeType, customInstruction) {
         '',
         sceneInstruction,
         '',
-        'The jewelry is the absolute focal point. Ultra-sharp macro detail on the jewelry, 8K resolution, professional studio lighting that reveals every surface facet and texture.',
+        'The jewelry is the absolute focal point. Frame TIGHT — the jewelry should fill at least 40-50% of the image. Crop in close on the body part wearing it (hand, neck, ear, wrist). Minimal negative space, do NOT pull back to show full body. Ultra-sharp macro detail on the jewelry, 8K resolution, professional studio lighting that reveals every surface facet and texture.',
     ].join('\n');
 
-    const GEMINI_TIMEOUT_MS = 90_000;
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    const GEMINI_TIMEOUT_MS = 60_000;
+    for (let attempt = 1; attempt <= 2; attempt++) {
         try {
             const response = await ai.models.generateContent({
                 model: 'gemini-3-pro-image-preview',
@@ -199,7 +199,7 @@ async function generateModelShot(base64Image, mimeType, customInstruction) {
             if (imagePart) return imagePart.inlineData.data;
             console.log(`[Gemini] No image on attempt ${attempt} — retrying...`);
         } catch (err) {
-            if (attempt < 3) {
+            if (attempt < 2) {
                 const isTimeout = err.name === 'AbortError';
                 const delay = isTimeout ? 2000 : attempt * 5000;
                 console.log(`[Gemini] ${isTimeout ? 'Timeout' : 'Error'} on attempt ${attempt} (${err.message}) — retrying in ${delay / 1000}s...`);
@@ -209,7 +209,7 @@ async function generateModelShot(base64Image, mimeType, customInstruction) {
             }
         }
     }
-    throw new Error('Gemini returned no image after 3 attempts');
+    throw new Error('Gemini returned no image after 2 attempts');
 }
 
 // ── Start server ───────────────────────────────────────────────────────────────
