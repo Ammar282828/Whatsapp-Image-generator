@@ -1,0 +1,14 @@
+# Dependencies
+node_modules/
+functions/node_modules/
+
+# Environment variables — NEVER commit your real keys
+.env
+functions/.env
+
+# Firebase
+.firebase/
+firebase-debug.log
+
+# OS
+.DS_Store

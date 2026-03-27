@@ -1,0 +1,19 @@
+{
+  "name": "whatsapp-jewelry-bot",
+  "version": "1.0.0",
+  "description": "WhatsApp bot that converts jewelry images into photorealistic model shots using Google Imagen 3",
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@google/genai": "^0.7.0",
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "form-data": "^4.0.0"
+  }
+}
