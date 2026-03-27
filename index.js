@@ -178,23 +178,38 @@ async function generateModelShot(base64Image, mimeType, customInstruction) {
         'The jewelry is the absolute focal point. Ultra-sharp macro detail on the jewelry, 8K resolution, professional studio lighting that reveals every surface facet and texture.',
     ].join('\n');
 
-    const response = await ai.models.generateContent({
-        model: 'gemini-3-pro-image-preview',
-        contents: [{
-            parts: [
-                { text: prompt },
-                { inlineData: { mimeType, data: base64Image } },
-            ],
-        }],
-        config: {
-            responseModalities: ['TEXT', 'IMAGE'],
-        },
-    });
-
-    const parts = response.candidates?.[0]?.content?.parts || [];
-    const imagePart = parts.find(p => p.inlineData?.data && !p.thought);
-    if (!imagePart) throw new Error('Gemini returned no image');
-    return imagePart.inlineData.data;
+    const GEMINI_TIMEOUT_MS = 90_000;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            const response = await ai.models.generateContent({
+                model: 'gemini-3-pro-image-preview',
+                contents: [{
+                    parts: [
+                        { text: prompt },
+                        { inlineData: { mimeType, data: base64Image } },
+                    ],
+                }],
+                config: {
+                    responseModalities: ['TEXT', 'IMAGE'],
+                    httpOptions: { timeout: GEMINI_TIMEOUT_MS },
+                },
+            });
+            const parts = response.candidates?.[0]?.content?.parts || [];
+            const imagePart = parts.find(p => p.inlineData?.data && !p.thought);
+            if (imagePart) return imagePart.inlineData.data;
+            console.log(`[Gemini] No image on attempt ${attempt} — retrying...`);
+        } catch (err) {
+            if (attempt < 3) {
+                const isTimeout = err.name === 'AbortError';
+                const delay = isTimeout ? 2000 : attempt * 5000;
+                console.log(`[Gemini] ${isTimeout ? 'Timeout' : 'Error'} on attempt ${attempt} (${err.message}) — retrying in ${delay / 1000}s...`);
+                await new Promise(r => setTimeout(r, delay));
+            } else {
+                throw err;
+            }
+        }
+    }
+    throw new Error('Gemini returned no image after 3 attempts');
 }
 
 // ── Start server ───────────────────────────────────────────────────────────────

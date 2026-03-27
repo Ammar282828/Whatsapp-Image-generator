@@ -929,18 +929,26 @@ async function generateModelShot(images, scene, ai) {
         config: { responseModalities: ['TEXT', 'IMAGE'] },
     };
 
-    // Retry up to 3 times — handles both empty responses and transient network errors
+    // Retry up to 3 times — abort after 90s per attempt to avoid Gemini hanging
+    const GEMINI_TIMEOUT_MS = 90_000;
     for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-            const response = await ai.models.generateContent(requestPayload);
+            const response = await ai.models.generateContent({
+                ...requestPayload,
+                config: {
+                    ...requestPayload.config,
+                    httpOptions: { timeout: GEMINI_TIMEOUT_MS },
+                },
+            });
             const parts = response.candidates?.[0]?.content?.parts || [];
             const imagePart = parts.find(p => p.inlineData?.data && !p.thought);
             if (imagePart) return addWatermark(imagePart.inlineData.data);
             console.log(`[Gemini] No image on attempt ${attempt} — retrying...`);
         } catch (err) {
             if (attempt < 3) {
-                const delay = attempt * 5000;
-                console.log(`[Gemini] Network error on attempt ${attempt} (${err.message}) — retrying in ${delay / 1000}s...`);
+                const isTimeout = err.name === 'AbortError';
+                const delay = isTimeout ? 2000 : attempt * 5000;
+                console.log(`[Gemini] ${isTimeout ? 'Timeout' : 'Error'} on attempt ${attempt} (${err.message}) — retrying in ${delay / 1000}s...`);
                 await new Promise(r => setTimeout(r, delay));
             } else {
                 throw err;
