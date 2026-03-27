@@ -5,6 +5,7 @@ const { setGlobalOptions } = require('firebase-functions/v2');
 const express = require('express');
 const axios = require('axios');
 const sharp = require('sharp');
+const FormData = require('form-data');
 const { GoogleGenAI } = require('@google/genai');
 const admin = require('firebase-admin');
 
@@ -45,19 +46,15 @@ async function getLogos() {
 async function addWatermark(base64Image) {
     const imgBuf = Buffer.from(base64Image, 'base64');
     const { maroon, white } = await getLogos();
-    // Sample bottom-right quadrant for average brightness
-    const { data, info } = await sharp(imgBuf).raw().toBuffer({ resolveWithObject: true });
-    let sum = 0, count = 0;
-    const startY = Math.floor(info.height * 0.72);
-    const startX = Math.floor(info.width  * 0.72);
-    for (let y = startY; y < info.height; y++) {
-        for (let x = startX; x < info.width; x++) {
-            const idx = (y * info.width + x) * info.channels;
-            sum += 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
-            count++;
-        }
-    }
-    const brightness = count > 0 ? sum / count : 128;
+    // Sample bottom-right quadrant brightness using extract + stats (avoids decoding full image to raw)
+    const meta = await sharp(imgBuf).metadata();
+    const regionLeft = Math.floor(meta.width * 0.72);
+    const regionTop  = Math.floor(meta.height * 0.72);
+    const { channels } = await sharp(imgBuf)
+        .extract({ left: regionLeft, top: regionTop, width: meta.width - regionLeft, height: meta.height - regionTop })
+        .stats();
+    // Luminance-weighted mean: 0.299*R + 0.587*G + 0.114*B
+    const brightness = 0.299 * channels[0].mean + 0.587 * channels[1].mean + 0.114 * channels[2].mean;
     const logo = brightness < 128 ? white : maroon;
     // Extend logo with transparent padding so it sits WATERMARK_MARGIN px from the corner
     const paddedLogo = await sharp(logo)
@@ -65,19 +62,20 @@ async function addWatermark(base64Image) {
         .png().toBuffer();
     const result = await sharp(imgBuf)
         .composite([{ input: paddedLogo, gravity: 'southeast', blend: 'over' }])
-        .png().toBuffer();
+        .jpeg({ quality: 90 }).toBuffer();
     return result.toString('base64');
 }
 
 // ── Global function config ────────────────────────────────────────────────────
 setGlobalOptions({
     maxInstances: 10,
+    minInstances: 1,
     timeoutSeconds: 540,
     memory: '1GiB',
     region: 'us-central1',
 });
 
-const GRAPH_API = 'https://graph.facebook.com/v19.0';
+const GRAPH_API = 'https://graph.facebook.com/v22.0';
 
 // ── Build the Express app ─────────────────────────────────────────────────────
 function createApp(secrets) {
@@ -744,12 +742,11 @@ async function downloadWhatsAppMedia(mediaId, secrets) {
 
 // ── Upload generated image to Meta ────────────────────────────────────────────
 async function uploadMediaToMeta(base64Image, phoneNumberId, secrets) {
-    const FormData   = require('form-data');
     const form       = new FormData();
     const imageBuffer = Buffer.from(base64Image, 'base64');
 
-    form.append('file', imageBuffer, { filename: 'jewelry.png', contentType: 'image/png' });
-    form.append('type', 'image/png');
+    form.append('file', imageBuffer, { filename: 'jewelry.jpeg', contentType: 'image/jpeg' });
+    form.append('type', 'image/jpeg');
     form.append('messaging_product', 'whatsapp');
 
     const { data } = await axios.post(
@@ -961,15 +958,22 @@ async function generateModelShot(images, scene, ai) {
 }
 
 // ── Export as Firebase Cloud Function ─────────────────────────────────────────
-exports.api = onRequest((req, res) => {
-    const secrets = {
-        googleApiKey:       process.env.GOOGLE_API_KEY,
-        whatsappToken:      process.env.WHATSAPP_TOKEN,
-        whatsappPhoneId:    process.env.WHATSAPP_PHONE_ID,
-        webhookVerifyToken: process.env.WEBHOOK_VERIFY_TOKEN,
-    };
-    return createApp(secrets)(req, res);
-});
+// Cache the Express app per instance — avoids rebuilding routes/AI client on every request
+let _cachedApp = null;
+function getApp() {
+    if (!_cachedApp) {
+        const secrets = {
+            googleApiKey:       process.env.GOOGLE_API_KEY,
+            whatsappToken:      process.env.WHATSAPP_TOKEN,
+            whatsappPhoneId:    process.env.WHATSAPP_PHONE_ID,
+            webhookVerifyToken: process.env.WEBHOOK_VERIFY_TOKEN,
+        };
+        _cachedApp = createApp(secrets);
+    }
+    return _cachedApp;
+}
+
+exports.api = onRequest((req, res) => getApp()(req, res));
 
 // ── Daily token health check ───────────────────────────────────────────────────
 exports.tokenCheck = onSchedule('every 24 hours', async () => {

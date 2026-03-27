@@ -2,6 +2,7 @@ require('dotenv').config();
 
 const express = require('express');
 const axios = require('axios');
+const FormData = require('form-data');
 const { GoogleGenAI } = require('@google/genai');
 
 // ── Validate environment ───────────────────────────────────────────────────────
@@ -19,7 +20,7 @@ const WHATSAPP_PHONE_ID    = process.env.WHATSAPP_PHONE_ID;
 const WEBHOOK_VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN;
 const PORT                 = process.env.PORT || 3000;
 
-const GRAPH_API = 'https://graph.facebook.com/v19.0';
+const GRAPH_API = 'https://graph.facebook.com/v22.0';
 
 // ── Google AI client ───────────────────────────────────────────────────────────
 const ai = new GoogleGenAI({ apiKey: GOOGLE_API_KEY });
@@ -122,11 +123,10 @@ async function downloadWhatsAppMedia(mediaId) {
 // ── Upload generated image to Meta ────────────────────────────────────────────
 async function uploadMediaToMeta(base64Image, phoneNumberId) {
     const imageBuffer = Buffer.from(base64Image, 'base64');
-    const FormData    = require('form-data');
     const form        = new FormData();
 
-    form.append('file', imageBuffer, { filename: 'jewelry.png', contentType: 'image/png' });
-    form.append('type', 'image/png');
+    form.append('file', imageBuffer, { filename: 'jewelry.jpeg', contentType: 'image/jpeg' });
+    form.append('type', 'image/jpeg');
     form.append('messaging_product', 'whatsapp');
 
     const { data } = await axios.post(
