@@ -86,6 +86,52 @@ function createApp(secrets) {
     // Health check
     app.get('/', (_req, res) => res.send('WhatsApp Jewelry Bot is running'));
 
+    // ── Detailed health check ─────────────────────────────────────────────────
+    app.get('/health', async (_req, res) => {
+        const checks = { firestore: 'fail', whatsapp: 'fail', gemini: 'fail' };
+        const errors = {};
+
+        // Check Firestore connectivity
+        try {
+            await db.collection('_health').doc('ping').set({ at: Date.now() });
+            checks.firestore = 'ok';
+        } catch (err) {
+            errors.firestore = err.message;
+        }
+
+        // Check WhatsApp token validity
+        try {
+            await axios.get(`${GRAPH_API}/${secrets.whatsappPhoneId}`, {
+                headers: { Authorization: `Bearer ${secrets.whatsappToken}` },
+                timeout: 10_000,
+            });
+            checks.whatsapp = 'ok';
+        } catch (err) {
+            errors.whatsapp = err?.response?.status
+                ? `HTTP ${err?.response?.status}: ${err?.response?.data?.error?.message || 'unknown'}`
+                : err.message;
+        }
+
+        // Check Gemini API with a minimal text request
+        try {
+            await ai.models.generateContent({
+                model: 'gemini-3-pro-image-preview',
+                contents: [{ parts: [{ text: 'Reply with OK' }] }],
+                config: { httpOptions: { timeout: 10_000 } },
+            });
+            checks.gemini = 'ok';
+        } catch (err) {
+            errors.gemini = err.message;
+        }
+
+        const allOk = Object.values(checks).every(v => v === 'ok');
+        res.status(allOk ? 200 : 503).json({
+            status: allOk ? 'healthy' : 'degraded',
+            checks,
+            ...(Object.keys(errors).length && { errors }),
+        });
+    });
+
     // Webhook verification — Meta calls this once to confirm the endpoint
     app.get('/webhook', (req, res) => {
         const mode      = req.query['hub.mode'];

@@ -65,6 +65,49 @@ app.post('/webhook', async (req, res) => {
 
 app.get('/', (_req, res) => res.send('WhatsApp Jewelry Bot is running'));
 
+// ── Health check ──────────────────────────────────────────────────────────────
+const START_TIME = Date.now();
+
+app.get('/health', async (_req, res) => {
+    const checks = { whatsapp: 'fail', gemini: 'fail' };
+    const errors = {};
+
+    // Check WhatsApp token validity
+    try {
+        await axios.get(`${GRAPH_API}/${WHATSAPP_PHONE_ID}`, {
+            headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+            timeout: 10_000,
+        });
+        checks.whatsapp = 'ok';
+    } catch (err) {
+        errors.whatsapp = err?.response?.status
+            ? `HTTP ${err?.response?.status}: ${err?.response?.data?.error?.message || 'unknown'}`
+            : err.message;
+    }
+
+    // Check Gemini API with a minimal text request
+    try {
+        await ai.models.generateContent({
+            model: 'gemini-3-pro-image-preview',
+            contents: [{ parts: [{ text: 'Reply with OK' }] }],
+            config: { httpOptions: { timeout: 10_000 } },
+        });
+        checks.gemini = 'ok';
+    } catch (err) {
+        errors.gemini = err.message;
+    }
+
+    const allOk = Object.values(checks).every(v => v === 'ok');
+    const uptimeSeconds = Math.floor((Date.now() - START_TIME) / 1000);
+
+    res.status(allOk ? 200 : 503).json({
+        status: allOk ? 'healthy' : 'degraded',
+        uptime: `${Math.floor(uptimeSeconds / 3600)}h ${Math.floor((uptimeSeconds % 3600) / 60)}m ${uptimeSeconds % 60}s`,
+        checks,
+        ...(Object.keys(errors).length && { errors }),
+    });
+});
+
 // ── Message handler ────────────────────────────────────────────────────────────
 async function handleMessage(msg, phoneNumberId) {
     const from = msg.from; // sender's WhatsApp number
