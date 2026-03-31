@@ -709,17 +709,23 @@ async function handleMessage(msg, phoneNumberId, secrets, ai, reqId) {
             }
             return;
         }
-        const productDetails = descMatch ? descMatch[1].trim() : userText;
-        console.log(`[${reqId}] Generating description for: ${productDetails}`);
-        await sendText(from, secrets, '⏳ Writing your House of Mina description...');
-        try {
-            const description = await generateDescription(productDetails, ai);
-            await sendText(from, secrets, description);
-            console.log(`[${reqId}] Description sent.`);
-        } catch (err) {
-            console.error(`[${reqId}] Description error:`, err.message);
-            await sendText(from, secrets, '❌ Failed to generate description. Try again.');
+        if (descMatch) {
+            const productDetails = descMatch[1].trim();
+            console.log(`[${reqId}] Generating description for: ${productDetails}`);
+            await sendText(from, secrets, '⏳ Writing your House of Mina description...');
+            try {
+                const description = await generateDescription(productDetails, ai);
+                await sendText(from, secrets, description);
+                console.log(`[${reqId}] Description sent.`);
+            } catch (err) {
+                console.error(`[${reqId}] Description error:`, err.message);
+                await sendText(from, secrets, '❌ Failed to generate description. Try again.');
+            }
+            return;
         }
+
+        // Unrecognized text → show help
+        await sendText(from, secrets, `I didn't recognise that command. Type *help* to see what I can do.`);
         return;
     }
 
