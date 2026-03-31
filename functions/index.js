@@ -86,6 +86,52 @@ function createApp(secrets) {
     // Health check
     app.get('/', (_req, res) => res.send('WhatsApp Jewelry Bot is running'));
 
+    // ── Detailed health check ─────────────────────────────────────────────────
+    app.get('/health', async (_req, res) => {
+        const checks = { firestore: 'fail', whatsapp: 'fail', gemini: 'fail' };
+        const errors = {};
+
+        // Check Firestore connectivity
+        try {
+            await db.collection('_health').doc('ping').set({ at: Date.now() });
+            checks.firestore = 'ok';
+        } catch (err) {
+            errors.firestore = err.message;
+        }
+
+        // Check WhatsApp token validity
+        try {
+            await axios.get(`${GRAPH_API}/${secrets.whatsappPhoneId}`, {
+                headers: { Authorization: `Bearer ${secrets.whatsappToken}` },
+                timeout: 10_000,
+            });
+            checks.whatsapp = 'ok';
+        } catch (err) {
+            errors.whatsapp = err?.response?.status
+                ? `HTTP ${err?.response?.status}: ${err?.response?.data?.error?.message || 'unknown'}`
+                : err.message;
+        }
+
+        // Check Gemini API with a minimal text request
+        try {
+            await ai.models.generateContent({
+                model: 'gemini-3-pro-image-preview',
+                contents: [{ parts: [{ text: 'Reply with OK' }] }],
+                config: { httpOptions: { timeout: 10_000 } },
+            });
+            checks.gemini = 'ok';
+        } catch (err) {
+            errors.gemini = err.message;
+        }
+
+        const allOk = Object.values(checks).every(v => v === 'ok');
+        res.status(allOk ? 200 : 503).json({
+            status: allOk ? 'healthy' : 'degraded',
+            checks,
+            ...(Object.keys(errors).length && { errors }),
+        });
+    });
+
     // Webhook verification — Meta calls this once to confirm the endpoint
     app.get('/webhook', (req, res) => {
         const mode      = req.query['hub.mode'];
@@ -131,37 +177,57 @@ function createApp(secrets) {
     return app;
 }
 
-const HELP_MESSAGE = `👋 *House of Mina Bot*
+const HELP_MESSAGE = `👋 *House of Mina — AI Jewelry Studio*
 
-📸 *Batch mode (recommended):*
-1. Send one or more jewelry photos
-2. Each photo is queued — caption sets the scene
-3. Type *done* to generate from all angles at once
+Turn raw jewelry photos into professional product shots in seconds. Powered by Gemini AI.
 
-⚡ *Quick mode (single image instantly):*
-Add _now_ to caption: e.g. _flat now_ or just _now_
+━━━━━━━━━━━━━━━━━━━━
 
-🎬 *Scene captions:*
-• _(no caption)_ → elegant model shot
-• _model_ → fashion model, Vogue quality
+📸 *How to use*
+
+*Batch mode (recommended):*
+1. Send one or more photos of the same piece
+2. Type *done* — the bot generates from all angles at once
+3. More angles = better accuracy
+
+*Quick mode:*
+Add _now_ to your caption to skip the queue
+e.g. send a photo with caption _flat now_
+
+━━━━━━━━━━━━━━━━━━━━
+
+🎬 *Scenes*
+Set the scene with your photo caption or the *scene* command:
+• _(no caption)_ → model wearing the jewelry
+• _model_ → fashion model, Vogue-quality editorial
 • _flat_ → flat lay on white marble
-• _white_ → clean white e-commerce
-• _mannequin_ → on a mannequin
-• _bg: [description]_ → fully custom scene
+• _white_ → clean e-commerce on white
+• _mannequin_ → displayed on a mannequin form
+• _bg: your description_ → any custom scene you describe
 
-✍️ *Text commands:*
-• _done_ → generate from queued images
-• _status_ → check what's in your queue
-• _scene [type]_ → change scene without clearing queue
-• _cancel_ → clear the queue
-• _retry_ → re-run the last failed generation
-• _desc: [product details]_ → House of Mina WhatsApp copy
-• _help_ → show this menu
+━━━━━━━━━━━━━━━━━━━━
 
-💡 *Tips:*
-• Send front + back + detail shots for best accuracy
-• Scene locks on the first image's caption
-• Add plating info: _model, gold plated_`;
+✍️ *Commands*
+• *done* — generate from queued photos
+• *status* — see what's in your queue
+• *?* — quick live progress check
+• *scene [type]* — change scene without clearing queue
+• *cancel* — clear the queue and start over
+• *retry* — re-run the last failed generation
+• *desc* — auto-write product copy from queued photos
+• *desc: [details]* — product copy from a text description
+• *health* — check if the bot and APIs are online
+• *help* — show this menu
+
+━━━━━━━━━━━━━━━━━━━━
+
+💡 *Tips*
+• Send front, back & detail shots for best accuracy
+• Scene locks to the first caption — change it with *scene*
+• Add plating info in your caption: _model, gold plated_
+• You can queue the next batch while one is generating
+• Generation takes 1–5 minutes depending on complexity
+• Type *?* at any time to check live progress`;
 
 const SCENES = {
     model:      'The jewelry is worn by a beautiful, elegant woman — mid-20s, professionally styled. Single large softbox from camera-left, off-white seamless background. CRITICAL: determine the jewelry type from the reference and frame the shot accordingly — DO NOT shoot full-body or mid-body:\n- Ring → extreme close-up of her hand, fingers slightly curled, shot from slightly above. Her hand rests on a neutral surface or hangs naturally. Nails clean and natural. Skin on knuckles has real texture.\n- Earrings → tight portrait shot of her face from the side or three-quarter angle, framed from chin to just above the ear. Hair tucked behind the ear or pulled back to show the earring clearly. The earring is the focal point.\n- Necklace / pendant → close-up of her neck and upper chest, framed from collarbone to just below the chin. Décolletage visible, skin has real texture and natural warmth. Off-shoulder or low neckline.\n- Bracelet / bangle → close-up of her wrist and forearm, slightly angled, soft natural light catching the metal.\n- Brooch / hair accessory → tight crop on the exact placement area.\nIn every case: the jewelry fills a large portion of the frame. Real optical bokeh on the background. Expression and body are relaxed, not stiff or posed.',
@@ -371,7 +437,9 @@ async function checkImageQuality(base64) {
 }
 
 // ── Core image generation pipeline ───────────────────────────────────────────
-async function processImages(mediaIds, scene, label, from, phoneNumberId, secrets, ai, reqId) {
+const MAX_AUTO_QUEUE_DEPTH = 3;
+
+async function processImages(mediaIds, scene, label, from, phoneNumberId, secrets, ai, reqId, _depth = 0) {
     const log = async (text) => {
         console.log(`[${reqId}] ${text}`);
         await sendText(from, secrets, `[${reqId}] ${text}`).catch(() => {});
@@ -444,16 +512,20 @@ async function processImages(mediaIds, scene, label, from, phoneNumberId, secret
         await clearGenerating(from).catch(() => {});
 
         // Auto-start the next queued batch if user requested "done" during this run.
-        const shouldStartNext = await claimPendingNext(from).catch(() => false);
-        if (shouldStartNext) {
-            const session = await getSession(from).catch(() => null);
-            if (session?.mediaIds?.length) {
-                const { mediaIds, scene: nextScene } = session;
-                const nextLabel = getSceneLabel(nextScene);
-                await clearSession(from).catch(() => {});
-                const nextReqId = Math.random().toString(36).slice(2, 8).toUpperCase();
-                console.log(`[${reqId}] Starting queued next batch — ${mediaIds.length} image(s)`);
-                await processImages(mediaIds, nextScene, nextLabel, from, phoneNumberId, secrets, ai, nextReqId);
+        if (_depth >= MAX_AUTO_QUEUE_DEPTH) {
+            console.log(`[${reqId}] Max auto-queue depth (${MAX_AUTO_QUEUE_DEPTH}) reached — skipping next batch`);
+        } else {
+            const shouldStartNext = await claimPendingNext(from).catch(() => false);
+            if (shouldStartNext) {
+                const session = await getSession(from).catch(() => null);
+                if (session?.mediaIds?.length) {
+                    const { mediaIds, scene: nextScene } = session;
+                    const nextLabel = getSceneLabel(nextScene);
+                    await clearSession(from).catch(() => {});
+                    const nextReqId = Math.random().toString(36).slice(2, 8).toUpperCase();
+                    console.log(`[${reqId}] Starting queued next batch — ${mediaIds.length} image(s)`);
+                    await processImages(mediaIds, nextScene, nextLabel, from, phoneNumberId, secrets, ai, nextReqId, _depth + 1);
+                }
             }
         }
     }
@@ -471,6 +543,49 @@ async function handleMessage(msg, phoneNumberId, secrets, ai, reqId) {
 
         if (!userText || lower === 'help' || lower === 'hi' || lower === 'menu' || lower === 'start') {
             await sendText(from, secrets, HELP_MESSAGE);
+            return;
+        }
+
+        // health → system status check via WhatsApp
+        if (lower === 'health' || lower === '/health') {
+            const results = { firestore: 'fail', whatsapp: 'fail', gemini: 'fail' };
+            const errors = {};
+
+            try {
+                await db.collection('_health').doc('ping').set({ at: Date.now() });
+                results.firestore = 'ok';
+            } catch (err) { errors.firestore = err.message; }
+
+            try {
+                await axios.get(`${GRAPH_API}/${secrets.whatsappPhoneId}`, {
+                    headers: { Authorization: `Bearer ${secrets.whatsappToken}` },
+                    timeout: 10_000,
+                });
+                results.whatsapp = 'ok';
+            } catch (err) {
+                errors.whatsapp = err?.response?.status
+                    ? `HTTP ${err.response.status}`
+                    : err.message;
+            }
+
+            try {
+                await ai.models.generateContent({
+                    model: 'gemini-3-pro-image-preview',
+                    contents: [{ parts: [{ text: 'Reply with OK' }] }],
+                    config: { httpOptions: { timeout: 10_000 } },
+                });
+                results.gemini = 'ok';
+            } catch (err) { errors.gemini = err.message; }
+
+            const allOk = Object.values(results).every(v => v === 'ok');
+            const lines = [
+                allOk ? '🟢 *All systems online*' : '🔴 *System issues detected*',
+                '',
+                `• Firestore: ${results.firestore === 'ok' ? '✅' : '❌ ' + (errors.firestore || 'fail')}`,
+                `• WhatsApp API: ${results.whatsapp === 'ok' ? '✅' : '❌ ' + (errors.whatsapp || 'fail')}`,
+                `• Gemini AI: ${results.gemini === 'ok' ? '✅' : '❌ ' + (errors.gemini || 'fail')}`,
+            ];
+            await sendText(from, secrets, lines.join('\n'));
             return;
         }
 
@@ -638,17 +753,23 @@ async function handleMessage(msg, phoneNumberId, secrets, ai, reqId) {
             }
             return;
         }
-        const productDetails = descMatch ? descMatch[1].trim() : userText;
-        console.log(`[${reqId}] Generating description for: ${productDetails}`);
-        await sendText(from, secrets, '⏳ Writing your House of Mina description...');
-        try {
-            const description = await generateDescription(productDetails, ai);
-            await sendText(from, secrets, description);
-            console.log(`[${reqId}] Description sent.`);
-        } catch (err) {
-            console.error(`[${reqId}] Description error:`, err.message);
-            await sendText(from, secrets, '❌ Failed to generate description. Try again.');
+        if (descMatch) {
+            const productDetails = descMatch[1].trim();
+            console.log(`[${reqId}] Generating description for: ${productDetails}`);
+            await sendText(from, secrets, '⏳ Writing your House of Mina description...');
+            try {
+                const description = await generateDescription(productDetails, ai);
+                await sendText(from, secrets, description);
+                console.log(`[${reqId}] Description sent.`);
+            } catch (err) {
+                console.error(`[${reqId}] Description error:`, err.message);
+                await sendText(from, secrets, '❌ Failed to generate description. Try again.');
+            }
+            return;
         }
+
+        // Unrecognized text → show help
+        await sendText(from, secrets, `I didn't recognise that command. Type *help* to see what I can do.`);
         return;
     }
 
@@ -752,7 +873,7 @@ async function uploadMediaToMeta(base64Image, phoneNumberId, secrets) {
     const { data } = await axios.post(
         `${GRAPH_API}/${phoneNumberId}/media`,
         form,
-        { headers: { ...form.getHeaders(), Authorization: `Bearer ${secrets.whatsappToken}` } }
+        { headers: { ...form.getHeaders(), Authorization: `Bearer ${secrets.whatsappToken}` }, timeout: 60_000 }
     );
     return data.id;
 }
@@ -762,7 +883,7 @@ async function sendText(to, secrets, text) {
     await axios.post(
         `${GRAPH_API}/${secrets.whatsappPhoneId}/messages`,
         { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } },
-        { headers: { Authorization: `Bearer ${secrets.whatsappToken}`, 'Content-Type': 'application/json' } }
+        { headers: { Authorization: `Bearer ${secrets.whatsappToken}`, 'Content-Type': 'application/json' }, timeout: 30_000 }
     );
 }
 
@@ -770,7 +891,7 @@ async function sendImage(to, mediaId, caption, secrets) {
     await axios.post(
         `${GRAPH_API}/${secrets.whatsappPhoneId}/messages`,
         { messaging_product: 'whatsapp', to, type: 'image', image: { id: mediaId, caption } },
-        { headers: { Authorization: `Bearer ${secrets.whatsappToken}`, 'Content-Type': 'application/json' } }
+        { headers: { Authorization: `Bearer ${secrets.whatsappToken}`, 'Content-Type': 'application/json' }, timeout: 30_000 }
     );
 }
 
@@ -793,6 +914,7 @@ Return ONLY the scene description, no preamble or explanation.`;
         const response = await ai.models.generateContent({
             model: 'gemini-3.1-pro-preview',
             contents: [{ parts: [{ text: prompt }] }],
+            config: { httpOptions: { timeout: 30_000 } },
         });
         const text = response.candidates?.[0]?.content?.parts?.find(p => p.text)?.text;
         return text?.trim() || `Place the jewelry in this scene: ${rawDescription}.`;
@@ -848,6 +970,7 @@ Meet your new obsession. *A certified yellow sapphire. Brilliant zircon accents.
     const response = await ai.models.generateContent({
         model: 'gemini-3.1-pro-preview',
         contents: [{ parts }],
+        config: { httpOptions: { timeout: 60_000 } },
     });
     const text = response.candidates?.[0]?.content?.parts?.find(p => p.text)?.text;
     if (!text) throw new Error('No description generated');

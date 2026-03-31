@@ -65,6 +65,49 @@ app.post('/webhook', async (req, res) => {
 
 app.get('/', (_req, res) => res.send('WhatsApp Jewelry Bot is running'));
 
+// ── Health check ──────────────────────────────────────────────────────────────
+const START_TIME = Date.now();
+
+app.get('/health', async (_req, res) => {
+    const checks = { whatsapp: 'fail', gemini: 'fail' };
+    const errors = {};
+
+    // Check WhatsApp token validity
+    try {
+        await axios.get(`${GRAPH_API}/${WHATSAPP_PHONE_ID}`, {
+            headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+            timeout: 10_000,
+        });
+        checks.whatsapp = 'ok';
+    } catch (err) {
+        errors.whatsapp = err?.response?.status
+            ? `HTTP ${err?.response?.status}: ${err?.response?.data?.error?.message || 'unknown'}`
+            : err.message;
+    }
+
+    // Check Gemini API with a minimal text request
+    try {
+        await ai.models.generateContent({
+            model: 'gemini-3-pro-image-preview',
+            contents: [{ parts: [{ text: 'Reply with OK' }] }],
+            config: { httpOptions: { timeout: 10_000 } },
+        });
+        checks.gemini = 'ok';
+    } catch (err) {
+        errors.gemini = err.message;
+    }
+
+    const allOk = Object.values(checks).every(v => v === 'ok');
+    const uptimeSeconds = Math.floor((Date.now() - START_TIME) / 1000);
+
+    res.status(allOk ? 200 : 503).json({
+        status: allOk ? 'healthy' : 'degraded',
+        uptime: `${Math.floor(uptimeSeconds / 3600)}h ${Math.floor((uptimeSeconds % 3600) / 60)}m ${uptimeSeconds % 60}s`,
+        checks,
+        ...(Object.keys(errors).length && { errors }),
+    });
+});
+
 // ── Message handler ────────────────────────────────────────────────────────────
 async function handleMessage(msg, phoneNumberId) {
     const from = msg.from; // sender's WhatsApp number
@@ -72,7 +115,23 @@ async function handleMessage(msg, phoneNumberId) {
     // Only handle image messages
     if (msg.type !== 'image') {
         if (msg.type === 'text') {
-            await sendText(from, '👋 Send me a jewelry photo and I\'ll generate a stunning model shot wearing it.\n\nOptionally add a caption like _"on a white background"_ or _"on a mannequin"_ to customise the scene.');
+            await sendText(from, `👋 *House of Mina — AI Jewelry Studio*
+
+Turn raw jewelry photos into professional product shots in seconds.
+
+📸 *How to use*
+Send a jewelry photo and I'll generate a stunning model shot wearing it.
+
+🎬 *Scene captions*
+Add a caption to your photo to set the scene:
+• _(no caption)_ → model wearing the jewelry
+• _model_ → fashion model, Vogue-quality editorial
+• _flat_ → flat lay on white marble
+• _white_ → clean e-commerce on white
+• _mannequin_ → displayed on a mannequin form
+• _bg: your description_ → any custom scene
+
+💡 Add plating or material info in your caption for better results: _"on a white background, gold plated"_`);
         }
         return;
     }
@@ -106,12 +165,14 @@ async function downloadWhatsAppMedia(mediaId) {
     // 1. Get the media URL
     const { data: mediaInfo } = await axios.get(`${GRAPH_API}/${mediaId}`, {
         headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+        timeout: 30_000,
     });
 
     // 2. Download the actual bytes
     const { data: imageBuffer } = await axios.get(mediaInfo.url, {
         headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
         responseType: 'arraybuffer',
+        timeout: 120_000,
     });
 
     return {
@@ -132,7 +193,7 @@ async function uploadMediaToMeta(base64Image, phoneNumberId) {
     const { data } = await axios.post(
         `${GRAPH_API}/${phoneNumberId}/media`,
         form,
-        { headers: { ...form.getHeaders(), Authorization: `Bearer ${WHATSAPP_TOKEN}` } }
+        { headers: { ...form.getHeaders(), Authorization: `Bearer ${WHATSAPP_TOKEN}` }, timeout: 60_000 }
     );
 
     return data.id;
@@ -143,7 +204,7 @@ async function sendText(to, text) {
     await axios.post(
         `${GRAPH_API}/${WHATSAPP_PHONE_ID}/messages`,
         { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } },
-        { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
+        { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' }, timeout: 30_000 }
     );
 }
 
@@ -151,7 +212,7 @@ async function sendImage(to, mediaId, caption) {
     await axios.post(
         `${GRAPH_API}/${WHATSAPP_PHONE_ID}/messages`,
         { messaging_product: 'whatsapp', to, type: 'image', image: { id: mediaId, caption } },
-        { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
+        { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' }, timeout: 30_000 }
     );
 }
 
