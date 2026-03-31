@@ -216,6 +216,7 @@ Set the scene with your photo caption or the *scene* command:
 • *retry* — re-run the last failed generation
 • *desc* — auto-write product copy from queued photos
 • *desc: [details]* — product copy from a text description
+• *health* — check if the bot and APIs are online
 • *help* — show this menu
 
 ━━━━━━━━━━━━━━━━━━━━
@@ -542,6 +543,49 @@ async function handleMessage(msg, phoneNumberId, secrets, ai, reqId) {
 
         if (!userText || lower === 'help' || lower === 'hi' || lower === 'menu' || lower === 'start') {
             await sendText(from, secrets, HELP_MESSAGE);
+            return;
+        }
+
+        // health → system status check via WhatsApp
+        if (lower === 'health' || lower === '/health') {
+            const results = { firestore: 'fail', whatsapp: 'fail', gemini: 'fail' };
+            const errors = {};
+
+            try {
+                await db.collection('_health').doc('ping').set({ at: Date.now() });
+                results.firestore = 'ok';
+            } catch (err) { errors.firestore = err.message; }
+
+            try {
+                await axios.get(`${GRAPH_API}/${secrets.whatsappPhoneId}`, {
+                    headers: { Authorization: `Bearer ${secrets.whatsappToken}` },
+                    timeout: 10_000,
+                });
+                results.whatsapp = 'ok';
+            } catch (err) {
+                errors.whatsapp = err?.response?.status
+                    ? `HTTP ${err.response.status}`
+                    : err.message;
+            }
+
+            try {
+                await ai.models.generateContent({
+                    model: 'gemini-3-pro-image-preview',
+                    contents: [{ parts: [{ text: 'Reply with OK' }] }],
+                    config: { httpOptions: { timeout: 10_000 } },
+                });
+                results.gemini = 'ok';
+            } catch (err) { errors.gemini = err.message; }
+
+            const allOk = Object.values(results).every(v => v === 'ok');
+            const lines = [
+                allOk ? '🟢 *All systems online*' : '🔴 *System issues detected*',
+                '',
+                `• Firestore: ${results.firestore === 'ok' ? '✅' : '❌ ' + (errors.firestore || 'fail')}`,
+                `• WhatsApp API: ${results.whatsapp === 'ok' ? '✅' : '❌ ' + (errors.whatsapp || 'fail')}`,
+                `• Gemini AI: ${results.gemini === 'ok' ? '✅' : '❌ ' + (errors.gemini || 'fail')}`,
+            ];
+            await sendText(from, secrets, lines.join('\n'));
             return;
         }
 
