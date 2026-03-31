@@ -115,7 +115,23 @@ async function handleMessage(msg, phoneNumberId) {
     // Only handle image messages
     if (msg.type !== 'image') {
         if (msg.type === 'text') {
-            await sendText(from, '👋 Send me a jewelry photo and I\'ll generate a stunning model shot wearing it.\n\nOptionally add a caption like _"on a white background"_ or _"on a mannequin"_ to customise the scene.');
+            await sendText(from, `👋 *House of Mina — AI Jewelry Studio*
+
+Turn raw jewelry photos into professional product shots in seconds.
+
+📸 *How to use*
+Send a jewelry photo and I'll generate a stunning model shot wearing it.
+
+🎬 *Scene captions*
+Add a caption to your photo to set the scene:
+• _(no caption)_ → model wearing the jewelry
+• _model_ → fashion model, Vogue-quality editorial
+• _flat_ → flat lay on white marble
+• _white_ → clean e-commerce on white
+• _mannequin_ → displayed on a mannequin form
+• _bg: your description_ → any custom scene
+
+💡 Add plating or material info in your caption for better results: _"on a white background, gold plated"_`);
         }
         return;
     }

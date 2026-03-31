@@ -177,37 +177,56 @@ function createApp(secrets) {
     return app;
 }
 
-const HELP_MESSAGE = `👋 *House of Mina Bot*
+const HELP_MESSAGE = `👋 *House of Mina — AI Jewelry Studio*
 
-📸 *Batch mode (recommended):*
-1. Send one or more jewelry photos
-2. Each photo is queued — caption sets the scene
-3. Type *done* to generate from all angles at once
+Turn raw jewelry photos into professional product shots in seconds. Powered by Gemini AI.
 
-⚡ *Quick mode (single image instantly):*
-Add _now_ to caption: e.g. _flat now_ or just _now_
+━━━━━━━━━━━━━━━━━━━━
 
-🎬 *Scene captions:*
-• _(no caption)_ → elegant model shot
-• _model_ → fashion model, Vogue quality
+📸 *How to use*
+
+*Batch mode (recommended):*
+1. Send one or more photos of the same piece
+2. Type *done* — the bot generates from all angles at once
+3. More angles = better accuracy
+
+*Quick mode:*
+Add _now_ to your caption to skip the queue
+e.g. send a photo with caption _flat now_
+
+━━━━━━━━━━━━━━━━━━━━
+
+🎬 *Scenes*
+Set the scene with your photo caption or the *scene* command:
+• _(no caption)_ → model wearing the jewelry
+• _model_ → fashion model, Vogue-quality editorial
 • _flat_ → flat lay on white marble
-• _white_ → clean white e-commerce
-• _mannequin_ → on a mannequin
-• _bg: [description]_ → fully custom scene
+• _white_ → clean e-commerce on white
+• _mannequin_ → displayed on a mannequin form
+• _bg: your description_ → any custom scene you describe
 
-✍️ *Text commands:*
-• _done_ → generate from queued images
-• _status_ → check what's in your queue
-• _scene [type]_ → change scene without clearing queue
-• _cancel_ → clear the queue
-• _retry_ → re-run the last failed generation
-• _desc: [product details]_ → House of Mina WhatsApp copy
-• _help_ → show this menu
+━━━━━━━━━━━━━━━━━━━━
 
-💡 *Tips:*
-• Send front + back + detail shots for best accuracy
-• Scene locks on the first image's caption
-• Add plating info: _model, gold plated_`;
+✍️ *Commands*
+• *done* — generate from queued photos
+• *status* — see what's in your queue
+• *?* — quick live progress check
+• *scene [type]* — change scene without clearing queue
+• *cancel* — clear the queue and start over
+• *retry* — re-run the last failed generation
+• *desc* — auto-write product copy from queued photos
+• *desc: [details]* — product copy from a text description
+• *help* — show this menu
+
+━━━━━━━━━━━━━━━━━━━━
+
+💡 *Tips*
+• Send front, back & detail shots for best accuracy
+• Scene locks to the first caption — change it with *scene*
+• Add plating info in your caption: _model, gold plated_
+• You can queue the next batch while one is generating
+• Generation takes 1–5 minutes depending on complexity
+• Type *?* at any time to check live progress`;
 
 const SCENES = {
     model:      'The jewelry is worn by a beautiful, elegant woman — mid-20s, professionally styled. Single large softbox from camera-left, off-white seamless background. CRITICAL: determine the jewelry type from the reference and frame the shot accordingly — DO NOT shoot full-body or mid-body:\n- Ring → extreme close-up of her hand, fingers slightly curled, shot from slightly above. Her hand rests on a neutral surface or hangs naturally. Nails clean and natural. Skin on knuckles has real texture.\n- Earrings → tight portrait shot of her face from the side or three-quarter angle, framed from chin to just above the ear. Hair tucked behind the ear or pulled back to show the earring clearly. The earring is the focal point.\n- Necklace / pendant → close-up of her neck and upper chest, framed from collarbone to just below the chin. Décolletage visible, skin has real texture and natural warmth. Off-shoulder or low neckline.\n- Bracelet / bangle → close-up of her wrist and forearm, slightly angled, soft natural light catching the metal.\n- Brooch / hair accessory → tight crop on the exact placement area.\nIn every case: the jewelry fills a large portion of the frame. Real optical bokeh on the background. Expression and body are relaxed, not stiff or posed.',
