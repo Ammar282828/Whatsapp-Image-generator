@@ -371,7 +371,9 @@ async function checkImageQuality(base64) {
 }
 
 // ── Core image generation pipeline ───────────────────────────────────────────
-async function processImages(mediaIds, scene, label, from, phoneNumberId, secrets, ai, reqId) {
+const MAX_AUTO_QUEUE_DEPTH = 3;
+
+async function processImages(mediaIds, scene, label, from, phoneNumberId, secrets, ai, reqId, _depth = 0) {
     const log = async (text) => {
         console.log(`[${reqId}] ${text}`);
         await sendText(from, secrets, `[${reqId}] ${text}`).catch(() => {});
@@ -444,16 +446,20 @@ async function processImages(mediaIds, scene, label, from, phoneNumberId, secret
         await clearGenerating(from).catch(() => {});
 
         // Auto-start the next queued batch if user requested "done" during this run.
-        const shouldStartNext = await claimPendingNext(from).catch(() => false);
-        if (shouldStartNext) {
-            const session = await getSession(from).catch(() => null);
-            if (session?.mediaIds?.length) {
-                const { mediaIds, scene: nextScene } = session;
-                const nextLabel = getSceneLabel(nextScene);
-                await clearSession(from).catch(() => {});
-                const nextReqId = Math.random().toString(36).slice(2, 8).toUpperCase();
-                console.log(`[${reqId}] Starting queued next batch — ${mediaIds.length} image(s)`);
-                await processImages(mediaIds, nextScene, nextLabel, from, phoneNumberId, secrets, ai, nextReqId);
+        if (_depth >= MAX_AUTO_QUEUE_DEPTH) {
+            console.log(`[${reqId}] Max auto-queue depth (${MAX_AUTO_QUEUE_DEPTH}) reached — skipping next batch`);
+        } else {
+            const shouldStartNext = await claimPendingNext(from).catch(() => false);
+            if (shouldStartNext) {
+                const session = await getSession(from).catch(() => null);
+                if (session?.mediaIds?.length) {
+                    const { mediaIds, scene: nextScene } = session;
+                    const nextLabel = getSceneLabel(nextScene);
+                    await clearSession(from).catch(() => {});
+                    const nextReqId = Math.random().toString(36).slice(2, 8).toUpperCase();
+                    console.log(`[${reqId}] Starting queued next batch — ${mediaIds.length} image(s)`);
+                    await processImages(mediaIds, nextScene, nextLabel, from, phoneNumberId, secrets, ai, nextReqId, _depth + 1);
+                }
             }
         }
     }
@@ -752,7 +758,7 @@ async function uploadMediaToMeta(base64Image, phoneNumberId, secrets) {
     const { data } = await axios.post(
         `${GRAPH_API}/${phoneNumberId}/media`,
         form,
-        { headers: { ...form.getHeaders(), Authorization: `Bearer ${secrets.whatsappToken}` } }
+        { headers: { ...form.getHeaders(), Authorization: `Bearer ${secrets.whatsappToken}` }, timeout: 60_000 }
     );
     return data.id;
 }
@@ -762,7 +768,7 @@ async function sendText(to, secrets, text) {
     await axios.post(
         `${GRAPH_API}/${secrets.whatsappPhoneId}/messages`,
         { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } },
-        { headers: { Authorization: `Bearer ${secrets.whatsappToken}`, 'Content-Type': 'application/json' } }
+        { headers: { Authorization: `Bearer ${secrets.whatsappToken}`, 'Content-Type': 'application/json' }, timeout: 30_000 }
     );
 }
 
@@ -770,7 +776,7 @@ async function sendImage(to, mediaId, caption, secrets) {
     await axios.post(
         `${GRAPH_API}/${secrets.whatsappPhoneId}/messages`,
         { messaging_product: 'whatsapp', to, type: 'image', image: { id: mediaId, caption } },
-        { headers: { Authorization: `Bearer ${secrets.whatsappToken}`, 'Content-Type': 'application/json' } }
+        { headers: { Authorization: `Bearer ${secrets.whatsappToken}`, 'Content-Type': 'application/json' }, timeout: 30_000 }
     );
 }
 
@@ -793,6 +799,7 @@ Return ONLY the scene description, no preamble or explanation.`;
         const response = await ai.models.generateContent({
             model: 'gemini-3.1-pro-preview',
             contents: [{ parts: [{ text: prompt }] }],
+            config: { httpOptions: { timeout: 30_000 } },
         });
         const text = response.candidates?.[0]?.content?.parts?.find(p => p.text)?.text;
         return text?.trim() || `Place the jewelry in this scene: ${rawDescription}.`;
@@ -848,6 +855,7 @@ Meet your new obsession. *A certified yellow sapphire. Brilliant zircon accents.
     const response = await ai.models.generateContent({
         model: 'gemini-3.1-pro-preview',
         contents: [{ parts }],
+        config: { httpOptions: { timeout: 60_000 } },
     });
     const text = response.candidates?.[0]?.content?.parts?.find(p => p.text)?.text;
     if (!text) throw new Error('No description generated');

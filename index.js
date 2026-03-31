@@ -106,12 +106,14 @@ async function downloadWhatsAppMedia(mediaId) {
     // 1. Get the media URL
     const { data: mediaInfo } = await axios.get(`${GRAPH_API}/${mediaId}`, {
         headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+        timeout: 30_000,
     });
 
     // 2. Download the actual bytes
     const { data: imageBuffer } = await axios.get(mediaInfo.url, {
         headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
         responseType: 'arraybuffer',
+        timeout: 120_000,
     });
 
     return {
@@ -132,7 +134,7 @@ async function uploadMediaToMeta(base64Image, phoneNumberId) {
     const { data } = await axios.post(
         `${GRAPH_API}/${phoneNumberId}/media`,
         form,
-        { headers: { ...form.getHeaders(), Authorization: `Bearer ${WHATSAPP_TOKEN}` } }
+        { headers: { ...form.getHeaders(), Authorization: `Bearer ${WHATSAPP_TOKEN}` }, timeout: 60_000 }
     );
 
     return data.id;
@@ -143,7 +145,7 @@ async function sendText(to, text) {
     await axios.post(
         `${GRAPH_API}/${WHATSAPP_PHONE_ID}/messages`,
         { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } },
-        { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
+        { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' }, timeout: 30_000 }
     );
 }
 
@@ -151,7 +153,7 @@ async function sendImage(to, mediaId, caption) {
     await axios.post(
         `${GRAPH_API}/${WHATSAPP_PHONE_ID}/messages`,
         { messaging_product: 'whatsapp', to, type: 'image', image: { id: mediaId, caption } },
-        { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
+        { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' }, timeout: 30_000 }
     );
 }
 
