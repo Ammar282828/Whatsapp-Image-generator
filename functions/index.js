@@ -204,7 +204,7 @@ async function getSession(from) {
 
 async function addMediaIdToSession(from, mediaId, caption) {
     const ref = db.collection('sessions').doc(from);
-    let count, sceneLabel, showMenu;
+    let count, sceneLabel, showMenu, flowState;
     await db.runTransaction(async (t) => {
         const doc = await t.get(ref);
         const data = doc.exists ? doc.data() : {};
@@ -215,16 +215,52 @@ async function addMediaIdToSession(from, mediaId, caption) {
         count = mediaIds.length;
         sceneLabel = getSceneLabel(scene);
         showMenu = !data.menuSent;
+        flowState = data.flowState || null;
         t.set(ref, {
             mediaIds,
             scene,
             menuSent: true,
+            flowState: data.flowState || null,
+            jewelryType: data.jewelryType || null,
             updatedAt: now,
             queuedAt:  data.queuedAt || now,
             expiresAt: now + SESSION_EXPIRY_MS,
         });
     });
-    return { count, sceneLabel, showMenu };
+    return { count, sceneLabel, showMenu, flowState };
+}
+
+// ── Flow state helpers (multi-step menu tracking) ────────────────────────────
+async function setFlowState(from, flowState, scene, jewelryType) {
+    const ref = db.collection('sessions').doc(from);
+    const now = Date.now();
+    await db.runTransaction(async (t) => {
+        const doc = await t.get(ref);
+        const data = doc.exists ? doc.data() : {};
+        const update = {
+            flowState,
+            updatedAt: now,
+            expiresAt: now + SESSION_EXPIRY_MS,
+        };
+        if (scene !== undefined) update.scene = scene;
+        if (jewelryType !== undefined) update.jewelryType = jewelryType;
+        if (!doc.exists) {
+            update.mediaIds = [];
+            update.menuSent = false;
+            update.queuedAt = now;
+        }
+        t.set(ref, { ...data, ...update });
+    });
+}
+
+async function clearFlowState(from) {
+    const ref = db.collection('sessions').doc(from);
+    await db.runTransaction(async (t) => {
+        const doc = await t.get(ref);
+        if (doc.exists) {
+            t.update(ref, { flowState: null, jewelryType: null });
+        }
+    });
 }
 
 async function clearSession(from) {
@@ -430,6 +466,15 @@ async function processImages(mediaIds, scene, label, from, phoneNumberId, secret
         }
 
         await log(`🎉 Done! Total: ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
+        await sendButtons(
+            from, secrets,
+            'What would you like to do next?',
+            [
+                { id: 'btn_new',   title: '📸 New Photo' },
+                { id: 'btn_retry', title: '🔄 Regenerate' },
+                { id: 'btn_help',  title: '📋 Menu' },
+            ],
+        ).catch(() => {});
         await clearRetryJob(from);
         await clearStatus(from);
     } catch (err) {
@@ -439,6 +484,15 @@ async function processImages(mediaIds, scene, label, from, phoneNumberId, secret
             ? '⚠️ Blocked by safety filters. Try a different photo.'
             : `❌ Error: ${JSON.stringify(detail)}`;
         await sendText(from, secrets, `[${reqId}] ${errMsg}`).catch(() => {});
+        await sendButtons(
+            from, secrets,
+            'Generation failed. What would you like to do?',
+            [
+                { id: 'btn_retry', title: '🔄 Retry' },
+                { id: 'btn_new',   title: '📸 New Photo' },
+                { id: 'btn_help',  title: '📋 Menu' },
+            ],
+        ).catch(() => {});
         await clearStatus(from);
     } finally {
         await clearGenerating(from).catch(() => {});
@@ -464,13 +518,217 @@ async function handleMessage(msg, phoneNumberId, secrets, ai, reqId) {
     const from = msg.from;
     console.log(`[${reqId}] From: ${from} | Type: ${msg.type}`);
 
+    // ── Interactive replies (button taps & list selections) ──
+    if (msg.type === 'interactive') {
+        const interactiveType = msg.interactive?.type;
+        const replyId = interactiveType === 'button_reply'
+            ? msg.interactive.button_reply?.id
+            : msg.interactive.list_reply?.id;
+        console.log(`[${reqId}] Interactive: ${interactiveType} → ${replyId}`);
+
+        // ── Main menu flow selections ──
+        // "Put Jewellery on Model" → show jewelry type sub-menu
+        if (replyId === 'flow_model') {
+            await setFlowState(from, 'picking_jewelry', SCENES.model, undefined);
+            await sendJewelryTypeMenu(from, secrets);
+            return;
+        }
+
+        // Direct scene flows (no jewelry sub-menu needed) → ask for image
+        if (replyId === 'flow_flat' || replyId === 'flow_white' || replyId === 'flow_mannequin') {
+            const sceneKey = replyId.replace('flow_', '');
+            const { scene, label } = resolveScene(sceneKey);
+            await setFlowState(from, 'awaiting_image', scene, undefined);
+            await sendText(from, secrets, `Please upload an image to continue 🔗📸\n\n_Scene: ${label}_`);
+            return;
+        }
+
+        // "Give your own prompt" → ask for prompt text
+        if (replyId === 'flow_custom') {
+            await setFlowState(from, 'awaiting_prompt', undefined, undefined);
+            await sendText(from, secrets, 'Type your scene description below.\n\nExample: _on a velvet cushion with rose petals and warm candlelight_');
+            return;
+        }
+
+        // "Product Description" → explain and wait
+        if (replyId === 'flow_desc') {
+            await sendText(from, secrets, '✍️ Send your jewelry photos, then type *desc* to generate WhatsApp product copy.\n\nOr type _desc: gold ring with emerald_ for text-only.');
+            return;
+        }
+
+        // "Bulk Generation" → explain batch mode
+        if (replyId === 'flow_bulk') {
+            await sendText(from, secrets, '📸 *Bulk generation:*\n1. Send multiple jewelry photos\n2. Each photo is queued with the same scene\n3. Type *done* to generate all at once\n\n_Send your first photo to get started!_');
+            return;
+        }
+
+        // "Check Status" → fall through to text handler
+        if (replyId === 'flow_status') {
+            msg.type = 'text';
+            msg.text = { body: '?' };
+        }
+
+        // ── Jewelry type sub-menu selections ──
+        if (replyId?.startsWith('jewel_')) {
+            const typeMap = {
+                jewel_set:      'jewellery set',
+                jewel_necklace: 'necklace',
+                jewel_earrings: 'earrings',
+                jewel_ring:     'ring',
+                jewel_bracelet: 'bracelet',
+                jewel_tikka:    'maang tikka',
+                jewel_brooch:   'brooch',
+            };
+            const jewelryType = typeMap[replyId] || 'jewelry';
+            await setFlowState(from, 'awaiting_image', undefined, jewelryType);
+            await sendText(from, secrets, `Please upload an image to continue 🔗📸\n\n_Jewellery: ${jewelryType}_`);
+            return;
+        }
+
+        // "Go Back" → main menu
+        if (replyId === 'menu_goback') {
+            await clearFlowState(from);
+            await sendMainMenu(from, secrets);
+            return;
+        }
+
+        // ── Action buttons (on queued images) ──
+        if (replyId === 'btn_done') {
+            if (await isGenerating(from)) {
+                const session = await getSession(from);
+                if (!session || !session.mediaIds?.length) {
+                    await sendText(from, secrets, '⏳ A generation is already running. Send your next photos and I\'ll run them right after.');
+                    return;
+                }
+                await setPendingNext(from);
+                const label = getSceneLabel(session.scene);
+                await sendText(from, secrets, `🧾 Next batch queued: ${session.mediaIds.length} image${session.mediaIds.length > 1 ? 's' : ''} — *${label}*.\nI'll start it automatically when the current one finishes.`);
+                return;
+            }
+            const session = await getSession(from);
+            if (!session || !session.mediaIds?.length) {
+                await setPendingDone(from);
+                return;
+            }
+            const age = Date.now() - (session.queuedAt || session.updatedAt || 0);
+            if (age > QUEUE_REJECT_MS) {
+                await clearSession(from);
+                await sendText(from, secrets, '⏰ Queued images expired (>60 min). Please resend the photos.');
+                return;
+            }
+            if (age > QUEUE_WARN_MS) {
+                await sendText(from, secrets, '⚠️ Images are >30 min old — they may have expired. Attempting anyway...');
+            }
+            const { mediaIds, scene } = session;
+            const label = getSceneLabel(scene);
+            await clearSession(from);
+            await processImages(mediaIds, scene, label, from, phoneNumberId, secrets, ai, reqId);
+            return;
+        }
+
+        if (replyId === 'btn_cancel') {
+            await Promise.all([clearSession(from), clearPendingDone(from)]);
+            await sendText(from, secrets, '🗑️ Queue cleared.');
+            await sendMainMenu(from, secrets);
+            return;
+        }
+
+        if (replyId === 'btn_retry') {
+            if (await isGenerating(from)) {
+                await sendText(from, secrets, '⏳ A generation is already running. Please wait, then try again.');
+                return;
+            }
+            const job = await getRetryJob(from);
+            if (!job) {
+                await sendText(from, secrets, '🤷 No failed job to retry.');
+                await sendMainMenu(from, secrets);
+                return;
+            }
+            await processImages(job.mediaIds, job.scene, job.label, from, phoneNumberId, secrets, ai, reqId);
+            return;
+        }
+
+        if (replyId === 'btn_scene_menu') {
+            const session = await getSession(from);
+            if (!session || !session.mediaIds?.length) {
+                await sendText(from, secrets, '📭 No active queue. Send some images first.');
+                return;
+            }
+            await sendList(
+                from, secrets,
+                `📸 ${session.mediaIds.length} image${session.mediaIds.length > 1 ? 's' : ''} in queue.\nPick a scene style below:`,
+                'Choose Scene',
+                [{
+                    title: 'Scene Styles',
+                    rows: [
+                        { id: 'scene_model',     title: 'Model Shot',       description: 'Elegant woman wearing your jewelry' },
+                        { id: 'scene_flat',      title: 'Flat Lay',         description: 'On white Carrara marble, overhead' },
+                        { id: 'scene_white',     title: 'White Background', description: 'Clean minimal e-commerce style' },
+                        { id: 'scene_mannequin', title: 'Mannequin',        description: 'On a ceramic display form' },
+                    ],
+                }],
+                'Change Scene'
+            );
+            return;
+        }
+
+        if (replyId === 'btn_new') {
+            await sendMainMenu(from, secrets);
+            return;
+        }
+
+        if (replyId === 'btn_help') {
+            await sendMainMenu(from, secrets);
+            return;
+        }
+
+        // Scene change from within a queued session
+        if (replyId?.startsWith('scene_')) {
+            const sceneKey = replyId.replace('scene_', '');
+            const session = await getSession(from);
+            if (!session || !session.mediaIds?.length) {
+                await sendText(from, secrets, '📭 No active queue. Send some images first.');
+                return;
+            }
+            const { scene, label } = resolveScene(sceneKey);
+            await db.runTransaction(async (t) => {
+                const ref = db.collection('sessions').doc(from);
+                const doc = await t.get(ref);
+                if (doc.exists) t.update(ref, { scene });
+            });
+            await sendButtons(
+                from, secrets,
+                `✅ Scene changed to *${label}*`,
+                [
+                    { id: 'btn_done',   title: '✅ Generate' },
+                    { id: 'btn_cancel', title: '🗑️ Cancel' },
+                ],
+            );
+            return;
+        }
+
+        // If we didn't handle it, ignore
+        if (msg.type === 'interactive') return;
+    }
+
     // ── Text commands ──
     if (msg.type === 'text') {
         const userText = msg.text?.body?.trim() || '';
         const lower = userText.toLowerCase();
 
+        // Check flow state — if user is mid-flow, intercept their text
+        const flowSession = await getSession(from);
+        if (flowSession?.flowState === 'awaiting_prompt' && userText && !['help','hi','menu','start','cancel','clear','reset'].includes(lower)) {
+            // User typed their custom scene description
+            const { scene } = resolveScene(userText);
+            await setFlowState(from, 'awaiting_image', scene, flowSession.jewelryType);
+            await sendText(from, secrets, `Please upload an image to continue 🔗📸\n\n_Scene: ${userText}_`);
+            return;
+        }
+
         if (!userText || lower === 'help' || lower === 'hi' || lower === 'menu' || lower === 'start') {
-            await sendText(from, secrets, HELP_MESSAGE);
+            await clearFlowState(from).catch(() => {});
+            await sendMainMenu(from, secrets);
             return;
         }
 
@@ -525,8 +783,15 @@ async function handleMessage(msg, phoneNumberId, secrets, ai, reqId) {
             } else {
                 const ageMin = Math.round((Date.now() - (session.queuedAt || session.updatedAt)) / 60000);
                 const label  = getSceneLabel(session.scene);
-                await sendText(from, secrets,
-                    `📋 *Queue status*\n📸 ${session.mediaIds.length} image${session.mediaIds.length > 1 ? 's' : ''} queued\n🎬 Scene: *${label}*\n🕒 Queued ${ageMin} min ago\n\nType *done* to generate or *cancel* to clear.`);
+                await sendButtons(
+                    from, secrets,
+                    `📋 *Queue status*\n📸 ${session.mediaIds.length} image${session.mediaIds.length > 1 ? 's' : ''} queued\n🎬 Scene: *${label}*\n🕒 Queued ${ageMin} min ago`,
+                    [
+                        { id: 'btn_done',       title: '✅ Generate' },
+                        { id: 'btn_scene_menu', title: '🎬 Change Scene' },
+                        { id: 'btn_cancel',     title: '🗑️ Cancel' },
+                    ],
+                );
             }
             return;
         }
@@ -547,7 +812,14 @@ async function handleMessage(msg, phoneNumberId, secrets, ai, reqId) {
                 const doc = await t.get(ref);
                 if (doc.exists) t.update(ref, { scene });
             });
-            await sendText(from, secrets, `✅ Scene set to *${label}*. Type *done* to generate.`);
+            await sendButtons(
+                from, secrets,
+                `✅ Scene changed to *${label}*`,
+                [
+                    { id: 'btn_done',   title: '✅ Generate' },
+                    { id: 'btn_cancel', title: '🗑️ Cancel' },
+                ],
+            );
             return;
         }
 
@@ -658,6 +930,23 @@ async function handleMessage(msg, phoneNumberId, secrets, ai, reqId) {
     const mediaId = msg.image.id;
     const caption = (msg.image.caption || '').trim() || null;
 
+    // ── Flow-driven: user came through the menu flow → auto-process immediately ──
+    const imgSession = await getSession(from);
+    if (imgSession?.flowState === 'awaiting_image') {
+        const scene = imgSession.scene || SCENES.model;
+        const label = getSceneLabel(scene);
+        const jewelryType = imgSession.jewelryType;
+        await clearSession(from);
+        await sendText(from, secrets, `Processing your image ✨\n\nPlease wait for a minute for the magic to happen ⏳`);
+        // If a jewelry type was selected, inject it into the scene prompt
+        let finalScene = scene;
+        if (jewelryType) {
+            finalScene = scene.replace(/the jewelry/gi, `the ${jewelryType}`);
+        }
+        await processImages([mediaId], finalScene, label, from, phoneNumberId, secrets, ai, reqId);
+        return;
+    }
+
     // caption contains "quick" or "now" → skip queue, process immediately
     if (caption && /\b(quick|now)\b/i.test(caption)) {
         const cleanCaption = caption.replace(/\b(quick|now)\b/gi, '').trim() || null;
@@ -668,20 +957,29 @@ async function handleMessage(msg, phoneNumberId, secrets, ai, reqId) {
 
     // Standard: queue the media ID
     try {
-        const { count, sceneLabel, showMenu } = await addMediaIdToSession(from, mediaId, caption);
-        const sceneHint = showMenu
-            ? [
-                `🎬 Scene: *${sceneLabel}*`,
-                'To change, type *scene* followed by:',
-                '• _model_ — fashion model shot',
-                '• _flat_ — flat lay on marble',
-                '• _white_ — clean white background',
-                '• _mannequin_ — on a mannequin',
-                '• _bg: [anything]_ — fully custom scene',
-              ].join('\n')
-            : `🎬 Scene: *${sceneLabel}*`;
-        const reply = `📸 *Photo queued* — send more angles or type *done* to generate.\n\n${sceneHint}`;
-        await sendText(from, secrets, reply);
+        const { count, sceneLabel, showMenu, flowState } = await addMediaIdToSession(from, mediaId, caption);
+        if (showMenu) {
+            await sendButtons(
+                from, secrets,
+                `📸 *Photo ${count} queued*\n🎬 Scene: *${sceneLabel}*\n\nSend more angles or tap Generate.`,
+                [
+                    { id: 'btn_done',       title: '✅ Generate' },
+                    { id: 'btn_scene_menu', title: '🎬 Change Scene' },
+                    { id: 'btn_cancel',     title: '🗑️ Cancel' },
+                ],
+                'Photo Queued'
+            );
+        } else {
+            await sendButtons(
+                from, secrets,
+                `📸 *Photo ${count} queued* — scene: *${sceneLabel}*\n\nSend more angles or tap Generate.`,
+                [
+                    { id: 'btn_done',       title: '✅ Generate' },
+                    { id: 'btn_scene_menu', title: '🎬 Change Scene' },
+                    { id: 'btn_cancel',     title: '🗑️ Cancel' },
+                ],
+            );
+        }
         console.log(`[${reqId}] Image ${count} queued for ${from}`);
 
         // If user already typed "done" before images landed, auto-trigger processing
@@ -771,6 +1069,90 @@ async function sendImage(to, mediaId, caption, secrets) {
         `${GRAPH_API}/${secrets.whatsappPhoneId}/messages`,
         { messaging_product: 'whatsapp', to, type: 'image', image: { id: mediaId, caption } },
         { headers: { Authorization: `Bearer ${secrets.whatsappToken}`, 'Content-Type': 'application/json' } }
+    );
+}
+
+// ── Interactive message helpers (native WhatsApp menus) ─────────────────────
+async function sendButtons(to, secrets, body, buttons, header, footer) {
+    const interactive = {
+        type: 'button',
+        body: { text: body },
+        action: {
+            buttons: buttons.map(b => ({
+                type: 'reply',
+                reply: { id: b.id, title: b.title },
+            })),
+        },
+    };
+    if (header) interactive.header = { type: 'text', text: header };
+    if (footer) interactive.footer = { text: footer };
+    await axios.post(
+        `${GRAPH_API}/${secrets.whatsappPhoneId}/messages`,
+        { messaging_product: 'whatsapp', to, type: 'interactive', interactive },
+        { headers: { Authorization: `Bearer ${secrets.whatsappToken}`, 'Content-Type': 'application/json' } }
+    );
+}
+
+async function sendList(to, secrets, body, buttonText, sections, header, footer) {
+    const interactive = {
+        type: 'list',
+        body: { text: body },
+        action: {
+            button: buttonText,
+            sections,
+        },
+    };
+    if (header) interactive.header = { type: 'text', text: header };
+    if (footer) interactive.footer = { text: footer };
+    await axios.post(
+        `${GRAPH_API}/${secrets.whatsappPhoneId}/messages`,
+        { messaging_product: 'whatsapp', to, type: 'interactive', interactive },
+        { headers: { Authorization: `Bearer ${secrets.whatsappToken}`, 'Content-Type': 'application/json' } }
+    );
+}
+
+// ── Menu flows (Jewel IA-style multi-step menus) ────────────────────────────
+async function sendMainMenu(to, secrets) {
+    await sendList(
+        to, secrets,
+        'Please select an option below 👇',
+        'Click here',
+        [{
+            title: 'Services',
+            rows: [
+                { id: 'flow_model',      title: 'Put Jewellery on Model', description: 'AI model wearing your jewelry' },
+                { id: 'flow_flat',       title: 'Create Catalogue Image', description: 'Flat lay on white marble' },
+                { id: 'flow_white',      title: 'E-commerce White BG',    description: 'Clean white background shot' },
+                { id: 'flow_mannequin',  title: 'Mannequin Display',      description: 'On a ceramic display form' },
+                { id: 'flow_custom',     title: 'Give Your Own Prompt',   description: 'Describe any custom scene' },
+                { id: 'flow_desc',       title: 'Product Description',    description: 'Generate WhatsApp product copy' },
+                { id: 'flow_bulk',       title: 'Bulk Generation',        description: 'Queue multiple images at once' },
+                { id: 'flow_status',     title: 'Check Status',           description: 'See queue & generation progress' },
+            ],
+        }],
+        'House of Mina',
+    );
+}
+
+async function sendJewelryTypeMenu(to, secrets) {
+    await sendList(
+        to, secrets,
+        'What kind of jewellery?',
+        'Select Jewellery',
+        [{
+            title: 'Jewellery Type',
+            rows: [
+                { id: 'jewel_set',       title: 'Jewellery Set',          description: 'Full matching set' },
+                { id: 'jewel_necklace',  title: 'Necklace',              description: 'Necklace or pendant' },
+                { id: 'jewel_earrings',  title: 'Earrings',              description: 'Studs, drops, or chandeliers' },
+                { id: 'jewel_ring',      title: 'Ring',                  description: 'Solitaire, band, or cocktail' },
+                { id: 'jewel_bracelet',  title: 'Bracelet / Bangle',     description: 'Bracelet, bangle, or kada' },
+                { id: 'jewel_tikka',     title: 'Maang Tikka',           description: 'Forehead jewelry' },
+                { id: 'jewel_brooch',    title: 'Brooch / Hair Clip',    description: 'Brooch or hair accessory' },
+                { id: 'menu_goback',     title: 'Go Back',               description: 'Return to main menu' },
+            ],
+        }],
+        'Select Jewellery',
     );
 }
 
