@@ -1,6 +1,12 @@
-const { onRequest } = require('firebase-functions/v2/https');
-const { onSchedule } = require('firebase-functions/v2/scheduler');
-const { setGlobalOptions } = require('firebase-functions/v2');
+// ── Detect runtime: Firebase Cloud Functions vs standalone (Railway / local) ──
+const IS_FIREBASE = !!process.env.FUNCTION_TARGET || !!process.env.K_SERVICE;
+
+let onRequest, onSchedule, setGlobalOptions;
+if (IS_FIREBASE) {
+    ({ onRequest } = require('firebase-functions/v2/https'));
+    ({ onSchedule } = require('firebase-functions/v2/scheduler'));
+    ({ setGlobalOptions } = require('firebase-functions/v2'));
+}
 
 const express = require('express');
 const axios = require('axios');
@@ -9,7 +15,14 @@ const FormData = require('form-data');
 const { GoogleGenAI } = require('@google/genai');
 const admin = require('firebase-admin');
 
-if (!admin.apps.length) admin.initializeApp();
+if (!IS_FIREBASE && process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
+    // Railway: parse service account from env var
+    const creds = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
+    if (!admin.apps.length) admin.initializeApp({ credential: admin.credential.cert(creds) });
+} else {
+    // Firebase or default credentials
+    if (!admin.apps.length) admin.initializeApp();
+}
 const db = admin.firestore();
 
 // ── Timing constants ──────────────────────────────────────────────────────────
@@ -66,14 +79,16 @@ async function addWatermark(base64Image) {
     return result.toString('base64');
 }
 
-// ── Global function config ────────────────────────────────────────────────────
-setGlobalOptions({
-    maxInstances: 10,
-    minInstances: 1,
-    timeoutSeconds: 540,
-    memory: '1GiB',
-    region: 'us-central1',
-});
+// ── Global function config (Firebase only) ───────────────────────────────────
+if (IS_FIREBASE) {
+    setGlobalOptions({
+        maxInstances: 10,
+        minInstances: 1,
+        timeoutSeconds: 540,
+        memory: '1GiB',
+        region: 'us-central1',
+    });
+}
 
 const GRAPH_API = 'https://graph.facebook.com/v22.0';
 
@@ -85,52 +100,6 @@ function createApp(secrets) {
 
     // Health check
     app.get('/', (_req, res) => res.send('WhatsApp Jewelry Bot is running'));
-
-    // ── Detailed health check ─────────────────────────────────────────────────
-    app.get('/health', async (_req, res) => {
-        const checks = { firestore: 'fail', whatsapp: 'fail', gemini: 'fail' };
-        const errors = {};
-
-        // Check Firestore connectivity
-        try {
-            await db.collection('_health').doc('ping').set({ at: Date.now() });
-            checks.firestore = 'ok';
-        } catch (err) {
-            errors.firestore = err.message;
-        }
-
-        // Check WhatsApp token validity
-        try {
-            await axios.get(`${GRAPH_API}/${secrets.whatsappPhoneId}`, {
-                headers: { Authorization: `Bearer ${secrets.whatsappToken}` },
-                timeout: 10_000,
-            });
-            checks.whatsapp = 'ok';
-        } catch (err) {
-            errors.whatsapp = err?.response?.status
-                ? `HTTP ${err?.response?.status}: ${err?.response?.data?.error?.message || 'unknown'}`
-                : err.message;
-        }
-
-        // Check Gemini API with a minimal text request
-        try {
-            await ai.models.generateContent({
-                model: 'gemini-3-pro-image-preview',
-                contents: [{ parts: [{ text: 'Reply with OK' }] }],
-                config: { httpOptions: { timeout: 10_000 } },
-            });
-            checks.gemini = 'ok';
-        } catch (err) {
-            errors.gemini = err.message;
-        }
-
-        const allOk = Object.values(checks).every(v => v === 'ok');
-        res.status(allOk ? 200 : 503).json({
-            status: allOk ? 'healthy' : 'degraded',
-            checks,
-            ...(Object.keys(errors).length && { errors }),
-        });
-    });
 
     // Webhook verification — Meta calls this once to confirm the endpoint
     app.get('/webhook', (req, res) => {
@@ -177,57 +146,37 @@ function createApp(secrets) {
     return app;
 }
 
-const HELP_MESSAGE = `👋 *House of Mina — AI Jewelry Studio*
+const HELP_MESSAGE = `👋 *House of Mina Bot*
 
-Turn raw jewelry photos into professional product shots in seconds. Powered by Gemini AI.
+📸 *Batch mode (recommended):*
+1. Send one or more jewelry photos
+2. Each photo is queued — caption sets the scene
+3. Type *done* to generate from all angles at once
 
-━━━━━━━━━━━━━━━━━━━━
+⚡ *Quick mode (single image instantly):*
+Add _now_ to caption: e.g. _flat now_ or just _now_
 
-📸 *How to use*
-
-*Batch mode (recommended):*
-1. Send one or more photos of the same piece
-2. Type *done* — the bot generates from all angles at once
-3. More angles = better accuracy
-
-*Quick mode:*
-Add _now_ to your caption to skip the queue
-e.g. send a photo with caption _flat now_
-
-━━━━━━━━━━━━━━━━━━━━
-
-🎬 *Scenes*
-Set the scene with your photo caption or the *scene* command:
-• _(no caption)_ → model wearing the jewelry
-• _model_ → fashion model, Vogue-quality editorial
+🎬 *Scene captions:*
+• _(no caption)_ → elegant model shot
+• _model_ → fashion model, Vogue quality
 • _flat_ → flat lay on white marble
-• _white_ → clean e-commerce on white
-• _mannequin_ → displayed on a mannequin form
-• _bg: your description_ → any custom scene you describe
+• _white_ → clean white e-commerce
+• _mannequin_ → on a mannequin
+• _bg: [description]_ → fully custom scene
 
-━━━━━━━━━━━━━━━━━━━━
+✍️ *Text commands:*
+• _done_ → generate from queued images
+• _status_ → check what's in your queue
+• _scene [type]_ → change scene without clearing queue
+• _cancel_ → clear the queue
+• _retry_ → re-run the last failed generation
+• _desc: [product details]_ → House of Mina WhatsApp copy
+• _help_ → show this menu
 
-✍️ *Commands*
-• *done* — generate from queued photos
-• *status* — see what's in your queue
-• *?* — quick live progress check
-• *scene [type]* — change scene without clearing queue
-• *cancel* — clear the queue and start over
-• *retry* — re-run the last failed generation
-• *desc* — auto-write product copy from queued photos
-• *desc: [details]* — product copy from a text description
-• *health* — check if the bot and APIs are online
-• *help* — show this menu
-
-━━━━━━━━━━━━━━━━━━━━
-
-💡 *Tips*
-• Send front, back & detail shots for best accuracy
-• Scene locks to the first caption — change it with *scene*
-• Add plating info in your caption: _model, gold plated_
-• You can queue the next batch while one is generating
-• Generation takes 1–5 minutes depending on complexity
-• Type *?* at any time to check live progress`;
+💡 *Tips:*
+• Send front + back + detail shots for best accuracy
+• Scene locks on the first image's caption
+• Add plating info: _model, gold plated_`;
 
 const SCENES = {
     model:      'The jewelry is worn by a beautiful, elegant woman — mid-20s, professionally styled. Single large softbox from camera-left, off-white seamless background. CRITICAL: determine the jewelry type from the reference and frame the shot accordingly — DO NOT shoot full-body or mid-body:\n- Ring → extreme close-up of her hand, fingers slightly curled, shot from slightly above. Her hand rests on a neutral surface or hangs naturally. Nails clean and natural. Skin on knuckles has real texture.\n- Earrings → tight portrait shot of her face from the side or three-quarter angle, framed from chin to just above the ear. Hair tucked behind the ear or pulled back to show the earring clearly. The earring is the focal point.\n- Necklace / pendant → close-up of her neck and upper chest, framed from collarbone to just below the chin. Décolletage visible, skin has real texture and natural warmth. Off-shoulder or low neckline.\n- Bracelet / bangle → close-up of her wrist and forearm, slightly angled, soft natural light catching the metal.\n- Brooch / hair accessory → tight crop on the exact placement area.\nIn every case: the jewelry fills a large portion of the frame. Real optical bokeh on the background. Expression and body are relaxed, not stiff or posed.',
@@ -473,9 +422,7 @@ async function checkImageQuality(base64) {
 }
 
 // ── Core image generation pipeline ───────────────────────────────────────────
-const MAX_AUTO_QUEUE_DEPTH = 3;
-
-async function processImages(mediaIds, scene, label, from, phoneNumberId, secrets, ai, reqId, _depth = 0) {
+async function processImages(mediaIds, scene, label, from, phoneNumberId, secrets, ai, reqId) {
     const log = async (text) => {
         console.log(`[${reqId}] ${text}`);
         await sendText(from, secrets, `[${reqId}] ${text}`).catch(() => {});
@@ -566,20 +513,16 @@ async function processImages(mediaIds, scene, label, from, phoneNumberId, secret
         await clearGenerating(from).catch(() => {});
 
         // Auto-start the next queued batch if user requested "done" during this run.
-        if (_depth >= MAX_AUTO_QUEUE_DEPTH) {
-            console.log(`[${reqId}] Max auto-queue depth (${MAX_AUTO_QUEUE_DEPTH}) reached — skipping next batch`);
-        } else {
-            const shouldStartNext = await claimPendingNext(from).catch(() => false);
-            if (shouldStartNext) {
-                const session = await getSession(from).catch(() => null);
-                if (session?.mediaIds?.length) {
-                    const { mediaIds, scene: nextScene } = session;
-                    const nextLabel = getSceneLabel(nextScene);
-                    await clearSession(from).catch(() => {});
-                    const nextReqId = Math.random().toString(36).slice(2, 8).toUpperCase();
-                    console.log(`[${reqId}] Starting queued next batch — ${mediaIds.length} image(s)`);
-                    await processImages(mediaIds, nextScene, nextLabel, from, phoneNumberId, secrets, ai, nextReqId, _depth + 1);
-                }
+        const shouldStartNext = await claimPendingNext(from).catch(() => false);
+        if (shouldStartNext) {
+            const session = await getSession(from).catch(() => null);
+            if (session?.mediaIds?.length) {
+                const { mediaIds, scene: nextScene } = session;
+                const nextLabel = getSceneLabel(nextScene);
+                await clearSession(from).catch(() => {});
+                const nextReqId = Math.random().toString(36).slice(2, 8).toUpperCase();
+                console.log(`[${reqId}] Starting queued next batch — ${mediaIds.length} image(s)`);
+                await processImages(mediaIds, nextScene, nextLabel, from, phoneNumberId, secrets, ai, nextReqId);
             }
         }
     }
@@ -804,49 +747,6 @@ async function handleMessage(msg, phoneNumberId, secrets, ai, reqId) {
             return;
         }
 
-        // health → system status check via WhatsApp
-        if (lower === 'health' || lower === '/health') {
-            const results = { firestore: 'fail', whatsapp: 'fail', gemini: 'fail' };
-            const errors = {};
-
-            try {
-                await db.collection('_health').doc('ping').set({ at: Date.now() });
-                results.firestore = 'ok';
-            } catch (err) { errors.firestore = err.message; }
-
-            try {
-                await axios.get(`${GRAPH_API}/${secrets.whatsappPhoneId}`, {
-                    headers: { Authorization: `Bearer ${secrets.whatsappToken}` },
-                    timeout: 10_000,
-                });
-                results.whatsapp = 'ok';
-            } catch (err) {
-                errors.whatsapp = err?.response?.status
-                    ? `HTTP ${err.response.status}`
-                    : err.message;
-            }
-
-            try {
-                await ai.models.generateContent({
-                    model: 'gemini-3-pro-image-preview',
-                    contents: [{ parts: [{ text: 'Reply with OK' }] }],
-                    config: { httpOptions: { timeout: 10_000 } },
-                });
-                results.gemini = 'ok';
-            } catch (err) { errors.gemini = err.message; }
-
-            const allOk = Object.values(results).every(v => v === 'ok');
-            const lines = [
-                allOk ? '🟢 *All systems online*' : '🔴 *System issues detected*',
-                '',
-                `• Firestore: ${results.firestore === 'ok' ? '✅' : '❌ ' + (errors.firestore || 'fail')}`,
-                `• WhatsApp API: ${results.whatsapp === 'ok' ? '✅' : '❌ ' + (errors.whatsapp || 'fail')}`,
-                `• Gemini AI: ${results.gemini === 'ok' ? '✅' : '❌ ' + (errors.gemini || 'fail')}`,
-            ];
-            await sendText(from, secrets, lines.join('\n'));
-            return;
-        }
-
         // ? → live status check
         if (lower === '?') {
             const [statusDoc, session, nextQueued] = await Promise.all([
@@ -1025,23 +925,17 @@ async function handleMessage(msg, phoneNumberId, secrets, ai, reqId) {
             }
             return;
         }
-        if (descMatch) {
-            const productDetails = descMatch[1].trim();
-            console.log(`[${reqId}] Generating description for: ${productDetails}`);
-            await sendText(from, secrets, '⏳ Writing your House of Mina description...');
-            try {
-                const description = await generateDescription(productDetails, ai);
-                await sendText(from, secrets, description);
-                console.log(`[${reqId}] Description sent.`);
-            } catch (err) {
-                console.error(`[${reqId}] Description error:`, err.message);
-                await sendText(from, secrets, '❌ Failed to generate description. Try again.');
-            }
-            return;
+        const productDetails = descMatch ? descMatch[1].trim() : userText;
+        console.log(`[${reqId}] Generating description for: ${productDetails}`);
+        await sendText(from, secrets, '⏳ Writing your House of Mina description...');
+        try {
+            const description = await generateDescription(productDetails, ai);
+            await sendText(from, secrets, description);
+            console.log(`[${reqId}] Description sent.`);
+        } catch (err) {
+            console.error(`[${reqId}] Description error:`, err.message);
+            await sendText(from, secrets, '❌ Failed to generate description. Try again.');
         }
-
-        // Unrecognized text → show help
-        await sendText(from, secrets, `I didn't recognise that command. Type *help* to see what I can do.`);
         return;
     }
 
@@ -1171,7 +1065,7 @@ async function uploadMediaToMeta(base64Image, phoneNumberId, secrets) {
     const { data } = await axios.post(
         `${GRAPH_API}/${phoneNumberId}/media`,
         form,
-        { headers: { ...form.getHeaders(), Authorization: `Bearer ${secrets.whatsappToken}` }, timeout: 60_000 }
+        { headers: { ...form.getHeaders(), Authorization: `Bearer ${secrets.whatsappToken}` } }
     );
     return data.id;
 }
@@ -1181,7 +1075,7 @@ async function sendText(to, secrets, text) {
     await axios.post(
         `${GRAPH_API}/${secrets.whatsappPhoneId}/messages`,
         { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } },
-        { headers: { Authorization: `Bearer ${secrets.whatsappToken}`, 'Content-Type': 'application/json' }, timeout: 30_000 }
+        { headers: { Authorization: `Bearer ${secrets.whatsappToken}`, 'Content-Type': 'application/json' } }
     );
 }
 
@@ -1189,7 +1083,7 @@ async function sendImage(to, mediaId, caption, secrets) {
     await axios.post(
         `${GRAPH_API}/${secrets.whatsappPhoneId}/messages`,
         { messaging_product: 'whatsapp', to, type: 'image', image: { id: mediaId, caption } },
-        { headers: { Authorization: `Bearer ${secrets.whatsappToken}`, 'Content-Type': 'application/json' }, timeout: 30_000 }
+        { headers: { Authorization: `Bearer ${secrets.whatsappToken}`, 'Content-Type': 'application/json' } }
     );
 }
 
@@ -1296,7 +1190,6 @@ Return ONLY the scene description, no preamble or explanation.`;
         const response = await ai.models.generateContent({
             model: 'gemini-3.1-pro-preview',
             contents: [{ parts: [{ text: prompt }] }],
-            config: { httpOptions: { timeout: 30_000 } },
         });
         const text = response.candidates?.[0]?.content?.parts?.find(p => p.text)?.text;
         return text?.trim() || `Place the jewelry in this scene: ${rawDescription}.`;
@@ -1352,7 +1245,6 @@ Meet your new obsession. *A certified yellow sapphire. Brilliant zircon accents.
     const response = await ai.models.generateContent({
         model: 'gemini-3.1-pro-preview',
         contents: [{ parts }],
-        config: { httpOptions: { timeout: 60_000 } },
     });
     const text = response.candidates?.[0]?.content?.parts?.find(p => p.text)?.text;
     if (!text) throw new Error('No description generated');
@@ -1462,8 +1354,7 @@ async function generateModelShot(images, scene, ai) {
     throw new Error('Gemini returned no image after 2 attempts');
 }
 
-// ── Export as Firebase Cloud Function ─────────────────────────────────────────
-// Cache the Express app per instance — avoids rebuilding routes/AI client on every request
+// ── App bootstrap ────────────────────────────────────────────────────────────
 let _cachedApp = null;
 function getApp() {
     if (!_cachedApp) {
@@ -1478,33 +1369,45 @@ function getApp() {
     return _cachedApp;
 }
 
-exports.api = onRequest((req, res) => getApp()(req, res));
+if (IS_FIREBASE) {
+    // ── Firebase Cloud Function exports ──────────────────────────────────────
+    exports.api = onRequest((req, res) => getApp()(req, res));
 
-// ── Daily token health check ───────────────────────────────────────────────────
-exports.tokenCheck = onSchedule('every 24 hours', async () => {
-    const token      = process.env.WHATSAPP_TOKEN;
-    const phoneId    = process.env.WHATSAPP_PHONE_ID;
-    const ownerPhone = process.env.OWNER_PHONE;
-    try {
-        await axios.get(`${GRAPH_API}/${phoneId}`, {
-            headers: { Authorization: `Bearer ${token}` },
-        });
-        console.log('[TokenCheck] ✓ Token is valid');
-    } catch (err) {
-        const status = err?.response?.status;
-        const msg    = err?.response?.data?.error?.message || err.message;
-        console.error(`[TokenCheck] ✗ FAILED (${status}): ${msg}`);
-        if (ownerPhone) {
-            await axios.post(
-                `${GRAPH_API}/${phoneId}/messages`,
-                {
-                    messaging_product: 'whatsapp',
-                    to: ownerPhone,
-                    type: 'text',
-                    text: { body: `🚨 *House of Mina Bot Alert*\n\nWhatsApp token EXPIRED (HTTP ${status}).\n\nFix:\n1. Get new token from developers.facebook.com\n2. Update WHATSAPP_TOKEN in functions/.env\n3. Run: firebase deploy --only functions --force` },
-                },
-                { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
-            ).catch(e => console.error('[TokenCheck] Could not send WhatsApp alert:', e.message));
+    exports.tokenCheck = onSchedule('every 24 hours', async () => {
+        const token      = process.env.WHATSAPP_TOKEN;
+        const phoneId    = process.env.WHATSAPP_PHONE_ID;
+        const ownerPhone = process.env.OWNER_PHONE;
+        try {
+            await axios.get(`${GRAPH_API}/${phoneId}`, {
+                headers: { Authorization: `Bearer ${token}` },
+            });
+            console.log('[TokenCheck] ✓ Token is valid');
+        } catch (err) {
+            const status = err?.response?.status;
+            const msg    = err?.response?.data?.error?.message || err.message;
+            console.error(`[TokenCheck] ✗ FAILED (${status}): ${msg}`);
+            if (ownerPhone) {
+                await axios.post(
+                    `${GRAPH_API}/${phoneId}/messages`,
+                    {
+                        messaging_product: 'whatsapp',
+                        to: ownerPhone,
+                        type: 'text',
+                        text: { body: `🚨 *House of Mina Bot Alert*\n\nWhatsApp token EXPIRED (HTTP ${status}).\n\nFix:\n1. Get new token from developers.facebook.com\n2. Update WHATSAPP_TOKEN in functions/.env\n3. Run: firebase deploy --only functions --force` },
+                    },
+                    { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
+                ).catch(e => console.error('[TokenCheck] Could not send WhatsApp alert:', e.message));
+            }
         }
+    });
+} else {
+    // ── Standalone server (Railway / local) ──────────────────────────────────
+    if (process.env.DOTENV !== 'false') {
+        try { require('dotenv').config(); } catch {}
     }
-});
+    const PORT = process.env.PORT || 3000;
+    const app = getApp();
+    app.listen(PORT, () => {
+        console.log(`🚀 WhatsApp Jewelry Bot listening on port ${PORT}`);
+    });
+}
