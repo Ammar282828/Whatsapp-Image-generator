@@ -1,6 +1,12 @@
-const { onRequest } = require('firebase-functions/v2/https');
-const { onSchedule } = require('firebase-functions/v2/scheduler');
-const { setGlobalOptions } = require('firebase-functions/v2');
+// ── Detect runtime: Firebase Cloud Functions vs standalone (Railway / local) ──
+const IS_FIREBASE = !!process.env.FUNCTION_TARGET || !!process.env.K_SERVICE;
+
+let onRequest, onSchedule, setGlobalOptions;
+if (IS_FIREBASE) {
+    ({ onRequest } = require('firebase-functions/v2/https'));
+    ({ onSchedule } = require('firebase-functions/v2/scheduler'));
+    ({ setGlobalOptions } = require('firebase-functions/v2'));
+}
 
 const express = require('express');
 const axios = require('axios');
@@ -9,7 +15,14 @@ const FormData = require('form-data');
 const { GoogleGenAI } = require('@google/genai');
 const admin = require('firebase-admin');
 
-if (!admin.apps.length) admin.initializeApp();
+if (!IS_FIREBASE && process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
+    // Railway: parse service account from env var
+    const creds = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
+    if (!admin.apps.length) admin.initializeApp({ credential: admin.credential.cert(creds) });
+} else {
+    // Firebase or default credentials
+    if (!admin.apps.length) admin.initializeApp();
+}
 const db = admin.firestore();
 
 // ── Timing constants ──────────────────────────────────────────────────────────
@@ -66,14 +79,16 @@ async function addWatermark(base64Image) {
     return result.toString('base64');
 }
 
-// ── Global function config ────────────────────────────────────────────────────
-setGlobalOptions({
-    maxInstances: 10,
-    minInstances: 1,
-    timeoutSeconds: 540,
-    memory: '1GiB',
-    region: 'us-central1',
-});
+// ── Global function config (Firebase only) ───────────────────────────────────
+if (IS_FIREBASE) {
+    setGlobalOptions({
+        maxInstances: 10,
+        minInstances: 1,
+        timeoutSeconds: 540,
+        memory: '1GiB',
+        region: 'us-central1',
+    });
+}
 
 const GRAPH_API = 'https://graph.facebook.com/v22.0';
 
@@ -1339,8 +1354,7 @@ async function generateModelShot(images, scene, ai) {
     throw new Error('Gemini returned no image after 2 attempts');
 }
 
-// ── Export as Firebase Cloud Function ─────────────────────────────────────────
-// Cache the Express app per instance — avoids rebuilding routes/AI client on every request
+// ── App bootstrap ────────────────────────────────────────────────────────────
 let _cachedApp = null;
 function getApp() {
     if (!_cachedApp) {
@@ -1355,33 +1369,45 @@ function getApp() {
     return _cachedApp;
 }
 
-exports.api = onRequest((req, res) => getApp()(req, res));
+if (IS_FIREBASE) {
+    // ── Firebase Cloud Function exports ──────────────────────────────────────
+    exports.api = onRequest((req, res) => getApp()(req, res));
 
-// ── Daily token health check ───────────────────────────────────────────────────
-exports.tokenCheck = onSchedule('every 24 hours', async () => {
-    const token      = process.env.WHATSAPP_TOKEN;
-    const phoneId    = process.env.WHATSAPP_PHONE_ID;
-    const ownerPhone = process.env.OWNER_PHONE;
-    try {
-        await axios.get(`${GRAPH_API}/${phoneId}`, {
-            headers: { Authorization: `Bearer ${token}` },
-        });
-        console.log('[TokenCheck] ✓ Token is valid');
-    } catch (err) {
-        const status = err?.response?.status;
-        const msg    = err?.response?.data?.error?.message || err.message;
-        console.error(`[TokenCheck] ✗ FAILED (${status}): ${msg}`);
-        if (ownerPhone) {
-            await axios.post(
-                `${GRAPH_API}/${phoneId}/messages`,
-                {
-                    messaging_product: 'whatsapp',
-                    to: ownerPhone,
-                    type: 'text',
-                    text: { body: `🚨 *House of Mina Bot Alert*\n\nWhatsApp token EXPIRED (HTTP ${status}).\n\nFix:\n1. Get new token from developers.facebook.com\n2. Update WHATSAPP_TOKEN in functions/.env\n3. Run: firebase deploy --only functions --force` },
-                },
-                { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
-            ).catch(e => console.error('[TokenCheck] Could not send WhatsApp alert:', e.message));
+    exports.tokenCheck = onSchedule('every 24 hours', async () => {
+        const token      = process.env.WHATSAPP_TOKEN;
+        const phoneId    = process.env.WHATSAPP_PHONE_ID;
+        const ownerPhone = process.env.OWNER_PHONE;
+        try {
+            await axios.get(`${GRAPH_API}/${phoneId}`, {
+                headers: { Authorization: `Bearer ${token}` },
+            });
+            console.log('[TokenCheck] ✓ Token is valid');
+        } catch (err) {
+            const status = err?.response?.status;
+            const msg    = err?.response?.data?.error?.message || err.message;
+            console.error(`[TokenCheck] ✗ FAILED (${status}): ${msg}`);
+            if (ownerPhone) {
+                await axios.post(
+                    `${GRAPH_API}/${phoneId}/messages`,
+                    {
+                        messaging_product: 'whatsapp',
+                        to: ownerPhone,
+                        type: 'text',
+                        text: { body: `🚨 *House of Mina Bot Alert*\n\nWhatsApp token EXPIRED (HTTP ${status}).\n\nFix:\n1. Get new token from developers.facebook.com\n2. Update WHATSAPP_TOKEN in functions/.env\n3. Run: firebase deploy --only functions --force` },
+                    },
+                    { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
+                ).catch(e => console.error('[TokenCheck] Could not send WhatsApp alert:', e.message));
+            }
         }
+    });
+} else {
+    // ── Standalone server (Railway / local) ──────────────────────────────────
+    if (process.env.DOTENV !== 'false') {
+        try { require('dotenv').config(); } catch {}
     }
-});
+    const PORT = process.env.PORT || 3000;
+    const app = getApp();
+    app.listen(PORT, () => {
+        console.log(`🚀 WhatsApp Jewelry Bot listening on port ${PORT}`);
+    });
+}
