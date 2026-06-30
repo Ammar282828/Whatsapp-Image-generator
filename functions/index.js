@@ -26,60 +26,14 @@ const QUEUE_WARN_MS     = 30 * 60 * 1000;       // warn user if queue >30 min ol
 const QUEUE_REJECT_MS   = 60 * 60 * 1000;       // reject if queue >60 min (WhatsApp URLs expire)
 const DEDUP_TTL_MS      = 5  * 60 * 1000;       // suppress duplicate webhook deliveries for 5 min
 
-// ── Logo watermark cache (loaded once per function instance) ──────────────────
-const LOGO_URL = 'https://houseofmina.store/cdn/shop/files/MINA_logo.png';
-const WATERMARK_WIDTH  = 120; // px — wide enough to be visible
-const WATERMARK_MARGIN = 12;  // px — gap from corner
-let _logoMaroon = null;
-let _logoWhite  = null;
-
-async function getLogos() {
-    if (_logoMaroon && _logoWhite) return { maroon: _logoMaroon, white: _logoWhite };
-    const { data } = await axios.get(LOGO_URL, { responseType: 'arraybuffer', timeout: 10000 });
-    const raw = Buffer.from(data);
-    // Maroon version — original colors, resized
-    _logoMaroon = await sharp(raw).resize(WATERMARK_WIDTH, null, { fit: 'inside' }).png().toBuffer();
-    // White version — same shape but all pixels become white
-    const { data: pixels, info } = await sharp(raw)
-        .resize(WATERMARK_WIDTH, null, { fit: 'inside' })
-        .raw()
-        .toBuffer({ resolveWithObject: true });
-    for (let i = 0; i < pixels.length; i += info.channels) {
-        pixels[i] = 255; pixels[i + 1] = 255; pixels[i + 2] = 255;
-    }
-    _logoWhite = await sharp(pixels, { raw: { width: info.width, height: info.height, channels: info.channels } }).png().toBuffer();
-    return { maroon: _logoMaroon, white: _logoWhite };
-}
-
-async function addWatermark(base64Image) {
-    const imgBuf = Buffer.from(base64Image, 'base64');
-    const { maroon, white } = await getLogos();
-    // Sample bottom-right quadrant brightness using extract + stats (avoids decoding full image to raw)
-    const meta = await sharp(imgBuf).metadata();
-    const regionLeft = Math.floor(meta.width * 0.72);
-    const regionTop  = Math.floor(meta.height * 0.72);
-    const { channels } = await sharp(imgBuf)
-        .extract({ left: regionLeft, top: regionTop, width: meta.width - regionLeft, height: meta.height - regionTop })
-        .stats();
-    // Luminance-weighted mean: 0.299*R + 0.587*G + 0.114*B
-    const brightness = 0.299 * channels[0].mean + 0.587 * channels[1].mean + 0.114 * channels[2].mean;
-    const logo = brightness < 128 ? white : maroon;
-    // Extend logo with transparent padding so it sits WATERMARK_MARGIN px from the corner
-    const paddedLogo = await sharp(logo)
-        .extend({ bottom: WATERMARK_MARGIN, right: WATERMARK_MARGIN, background: { r: 0, g: 0, b: 0, alpha: 0 } })
-        .png().toBuffer();
-    const result = await sharp(imgBuf)
-        .composite([{ input: paddedLogo, gravity: 'southeast', blend: 'over' }])
-        .jpeg({ quality: 90 }).toBuffer();
-    return result.toString('base64');
-}
-
 // ── Global function config ────────────────────────────────────────────────────
 setGlobalOptions({
         maxInstances: 10,
         minInstances: 1,
+        concurrency: 80,
         timeoutSeconds: 540,
         memory: '1GiB',
+        cpu: 1,
         region: 'us-central1',
     });
 
@@ -110,30 +64,52 @@ function createApp(secrets) {
 
     // Incoming messages from WhatsApp
     app.post('/webhook', async (req, res) => {
-        res.sendStatus(200); // Acknowledge immediately — Meta requires 200 within 5s
+        // NOTE: We do NOT send 200 immediately. Cloud Run throttles CPU after
+        // the response is sent, making async work 10-30x slower.
+        // Instead, we process the message first (menus/text are <2s), then respond.
+        // Meta allows up to 20 seconds for webhook responses.
 
         const body = req.body;
-        if (body.object !== 'whatsapp_business_account') return;
+        if (body.object !== 'whatsapp_business_account') {
+            res.sendStatus(200);
+            return;
+        }
 
+        // Collect messages to process
+        const tasks = [];
         for (const entry of body.entry || []) {
             for (const change of entry.changes || []) {
                 const messages = change.value?.messages;
                 if (!messages?.length) continue;
                 for (const msg of messages) {
                     const reqId = Math.random().toString(36).slice(2, 8).toUpperCase();
-                    if (msg.id && await isDuplicate(msg.id)) {
+                    if (msg.id && isDuplicate(msg.id)) {
                         console.log(`[${reqId}] Skipping duplicate msg ${msg.id}`);
                         continue;
                     }
-                    // Parallelise housekeeping — don't wait for markAsRead before handling
                     const phoneNumberId = change.value.metadata.phone_number_id;
-                    if (msg.id) markProcessed(msg.id); // fire-and-forget
+                    if (msg.id) markProcessed(msg.id);
                     markAsRead(msg.id, phoneNumberId, secrets.whatsappToken); // fire-and-forget
-                    await handleMessage(msg, phoneNumberId, secrets, ai, reqId)
-                        .catch(err => console.error(`[${reqId}] Unhandled:`, err.message));
+                    tasks.push({ msg, phoneNumberId, reqId });
                 }
             }
         }
+
+        // Process messages with full CPU. Send 200 as soon as all quick work
+        // is done, OR after 15s max (Meta allows 20s, leaving margin).
+        // Long-running image generation continues after 200 is sent.
+        let responded = false;
+        const safeRespond = () => {
+            if (!responded) { responded = true; res.sendStatus(200); }
+        };
+        const timer = setTimeout(safeRespond, 15000);
+
+        for (const { msg, phoneNumberId, reqId } of tasks) {
+            await handleMessage(msg, phoneNumberId, secrets, ai, reqId)
+                .catch(err => console.error(`[${reqId}] Unhandled:`, err.message));
+        }
+        clearTimeout(timer);
+        safeRespond();
     });
 
     return app;
@@ -254,6 +230,9 @@ async function addMediaIdToSession(from, mediaId, caption) {
             flowState: data.flowState || null,
             jewelryType: data.jewelryType || null,
             outputType: data.outputType || null,
+            angleConfig: data.angleConfig || null,
+            stoneColor: data.stoneColor || null,
+            metalColor: data.metalColor || null,
             updatedAt: now,
             queuedAt:  data.queuedAt || now,
             expiresAt: now + SESSION_EXPIRY_MS,
@@ -263,7 +242,7 @@ async function addMediaIdToSession(from, mediaId, caption) {
 }
 
 // ── Flow state helpers (multi-step menu tracking) ────────────────────────────
-async function setFlowState(from, flowState, scene, jewelryType, outputType) {
+async function setFlowState(from, flowState, scene, jewelryType, outputType, extras) {
     const ref = db.collection('sessions').doc(from);
     const now = Date.now();
     await db.runTransaction(async (t) => {
@@ -277,6 +256,8 @@ async function setFlowState(from, flowState, scene, jewelryType, outputType) {
         if (scene !== undefined) update.scene = scene;
         if (jewelryType !== undefined) update.jewelryType = jewelryType;
         if (outputType !== undefined) update.outputType = outputType;
+        // Merge extras (angleConfig, stoneColor, metalColor, etc.)
+        if (extras && typeof extras === 'object') Object.assign(update, extras);
         if (!doc.exists) {
             update.mediaIds = [];
             update.menuSent = false;
@@ -287,13 +268,15 @@ async function setFlowState(from, flowState, scene, jewelryType, outputType) {
 }
 
 async function clearFlowState(from) {
+    const _t = Date.now();
     const ref = db.collection('sessions').doc(from);
     await db.runTransaction(async (t) => {
         const doc = await t.get(ref);
         if (doc.exists) {
-            t.update(ref, { flowState: null, jewelryType: null, outputType: null });
+            t.update(ref, { flowState: null, jewelryType: null, outputType: null, angleConfig: null, stoneColor: null, metalColor: null });
         }
     });
+    console.log(`[clearFlowState] Firestore took ${Date.now() - _t}ms`);
 }
 
 async function clearSession(from) {
@@ -301,8 +284,8 @@ async function clearSession(from) {
 }
 
 // ── Retry job helpers ─────────────────────────────────────────────────────────
-async function saveRetryJob(from, mediaIds, scene, label) {
-    await db.collection('retry_jobs').doc(from).set({ mediaIds, scene, label, savedAt: Date.now() });
+async function saveRetryJob(from, mediaIds, scene, label, outputType, jewelryType, angleConfig) {
+    await db.collection('retry_jobs').doc(from).set({ mediaIds, scene, label, outputType: outputType || null, jewelryType: jewelryType || null, angleConfig: angleConfig || null, savedAt: Date.now() });
 }
 async function getRetryJob(from) {
     const doc = await db.collection('retry_jobs').doc(from).get();
@@ -344,7 +327,15 @@ async function clearGenerating(from) {
 }
 async function isGenerating(from) {
     const doc = await db.collection('generation_state').doc(from).get();
-    return !!(doc.exists && doc.data()?.running);
+    if (!doc.exists || !doc.data()?.running) return false;
+    // Auto-expire stale generating flags (e.g. crashed/timed-out runs) after 10 min
+    const age = Date.now() - (doc.data().at || 0);
+    if (age > 10 * 60 * 1000) {
+        await db.collection('generation_state').doc(from).delete().catch(() => {});
+        console.log(`[isGenerating] Cleared stale flag for ${from} (${Math.round(age/1000)}s old)`);
+        return false;
+    }
+    return true;
 }
 
 // If user types done while a run is active, we remember to auto-start the next queue.
@@ -390,17 +381,24 @@ function getSceneLabel(scene) {
     return scene.replace(/^Place the jewelry in this scene:\s*/i, '').replace(/\.$/, '');
 }
 
-// ── Deduplication helpers ─────────────────────────────────────────────────────
-async function isDuplicate(msgId) {
+// ── Deduplication helpers (in-memory for speed, Firestore as fallback) ────────
+const _dedupCache = new Map();
+const DEDUP_CLEANUP_INTERVAL = 60_000;
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of _dedupCache) {
+        if (now - v > DEDUP_TTL_MS) _dedupCache.delete(k);
+    }
+}, DEDUP_CLEANUP_INTERVAL);
+
+function isDuplicate(msgId) {
     if (!msgId) return false;
-    const doc = await db.collection('processed_msgs').doc(msgId).get();
-    if (!doc.exists) return false;
-    return (Date.now() - doc.data().processedAt) < DEDUP_TTL_MS;
+    return _dedupCache.has(msgId);
 }
 
-async function markProcessed(msgId) {
+function markProcessed(msgId) {
     if (!msgId) return;
-    await db.collection('processed_msgs').doc(msgId).set({ processedAt: Date.now() });
+    _dedupCache.set(msgId, Date.now());
 }
 
 // ── Mark message as read (shows blue ticks to user) ──────────────────────────
@@ -504,7 +502,7 @@ Write 2\u20134 plain sentences. Be specific about shapes, angles, and structures
 }
 
 // ── Ecommerce shot generation ───────────────────────────────────────────────
-async function generateEcommerceShot(imageInputs, customInstruction, angle, ai) {
+async function generateEcommerceShot(imageInputs, customInstruction, angle, ai, jewelryType) {
     const isDetail   = angle.id === 'detail';
     const isElevated = angle.id === 'elevated';
     const isBand     = angle.id === 'band';
@@ -632,9 +630,14 @@ async function generateEcommerceShot(imageInputs, customInstruction, angle, ai) 
         ];
     }
 
+    const earringPairNote = jewelryType === 'earrings'
+        ? 'EARRING PAIR: If the reference shows only a single earring, generate a matching symmetrical pair displayed side by side.'
+        : '';
+
     const prompt = isBand ? null : [
         'Use the uploaded image(s) as the EXACT reference of the jewelry piece.',
         contextNote,
+        ...(earringPairNote ? [earringPairNote] : []),
         '',
         'Extract the jewelry from whatever background or hand is in the reference and generate a professional luxury product photoshoot of the EXACT SAME piece.',
         'The jewelry must remain 100% identical to the original image(s) \u2014 do NOT change the design, shape, gemstones, metal color, texture, proportions, prong count, prong style, setting type, shank profile, or ANY details whatsoever.',
@@ -764,12 +767,27 @@ async function makeSquare(buffer) {
 }
 
 // ── Core image generation pipeline ───────────────────────────────────────────
-async function processImages(mediaIds, scene, label, from, phoneNumberId, secrets, ai, reqId, outputType) {
+async function processImages(mediaIds, scene, label, from, phoneNumberId, secrets, ai, reqId, outputType, jewelryType, angleConfig) {
     // Default to 'model' if no outputType specified
     const mode = outputType || 'model';
     const doEcommerce = mode === 'ecommerce' || mode === 'both';
     const doModel     = mode === 'model'     || mode === 'both';
-    const totalSteps  = mode === 'both' ? 8 : (mode === 'ecommerce' ? 7 : 4);
+    const bandEligible = jewelryType === 'ring' || jewelryType === 'bracelet';
+
+    // Resolve angle config (default: all angles, 1 model shot)
+    const ac = angleConfig || {};
+    const ecomCount = doEcommerce ? (ac.ecom === 'all' || ac.ecom === undefined ? (bandEligible ? 4 : 3) : Number(ac.ecom) || 0) : 0;
+    const modelCount = doModel ? (ac.model === undefined ? 1 : Number(ac.model) || 0) : 0;
+    const doBand = doEcommerce && bandEligible && ecomCount >= 4;
+    const totalImages = ecomCount + modelCount;
+
+    // Step count: download + generation steps + done
+    let stepCount = 1; // download step
+    if (ecomCount >= 1) stepCount++; // front view
+    if (ecomCount === 1 && modelCount > 0) stepCount++; // model shots after front-only
+    if (ecomCount >= 2) stepCount++; // parallel ecom (+ model if both)
+    if (ecomCount === 0 && modelCount > 0) stepCount++; // standalone model-only
+    const totalSteps = stepCount;
 
     const log = async (text) => {
         console.log(`[${reqId}] ${text}`);
@@ -784,7 +802,7 @@ async function processImages(mediaIds, scene, label, from, phoneNumberId, secret
 
     try {
         await setGenerating(from, reqId);
-        await saveRetryJob(from, mediaIds, scene, label);
+        await saveRetryJob(from, mediaIds, scene, label, mode, jewelryType, angleConfig);
         const startTime = Date.now();
         let step = 1;
 
@@ -815,76 +833,123 @@ async function processImages(mediaIds, scene, label, from, phoneNumberId, secret
         }
 
         // ── Ecommerce shots ──
-        if (doEcommerce) {
+        if (ecomCount >= 1) {
             // Step: generate front view first
-            await setStatus(from, step, 'Generating Front View (1 of 4 e-commerce angles)');
+            await setStatus(from, step, `Generating Front View (1 of ${ecomCount} e-commerce angle${ecomCount > 1 ? 's' : ''})`);
             await log(`\u23f3 Step ${step}/${totalSteps} \u2014 Generating *Front View*...`);
-            const frontBase64 = await generateEcommerceShot(images, null, ANGLES[0], ai);
-            const frontWatermarked = await addWatermark(frontBase64);
-            sendGeneratedImage(frontWatermarked, `\u2728 Front View \u2014 e-commerce`).catch(e => console.error(`[${reqId}] Send front failed:`, e.message));
+            const frontBase64 = await generateEcommerceShot(images, null, ANGLES[0], ai, jewelryType);
+            sendGeneratedImage(frontBase64, `\u2728 Front View \u2014 e-commerce`).catch(e => console.error(`[${reqId}] Send front failed:`, e.message));
             await log(`\u2705 Step ${step}/${totalSteps} \u2014 Front View done`);
             step++;
 
-            // Step: generate elevated + band + detail in parallel (with front as reference)
-            const frontRef = { base64: frontBase64, mimeType: 'image/png' };
-            const refsForAngles = [...images, frontRef];
-
-            await setStatus(from, step, 'Generating 3 more e-commerce angles in parallel');
-            await log(`\u23f3 Step ${step}/${totalSteps} \u2014 Generating *Elevated + Band + Detail* in parallel...`);
-
-            const parallelEcom = [
-                generateEcommerceShot(refsForAngles, null, ANGLES[1], ai)
-                    .then(async (b64) => {
-                        const wm = await addWatermark(b64);
-                        sendGeneratedImage(wm, `\u2728 ${ANGLES[1].label} \u2014 e-commerce`).catch(e => console.error(`[${reqId}] Send elevated failed:`, e.message));
-                    })
-                    .catch(err => { console.error(`[${reqId}] Elevated failed:`, err.message); return null; }),
-                generateEcommerceShot(refsForAngles, null, ANGLES[2], ai)
-                    .then(async (b64) => {
-                        const wm = await addWatermark(b64);
-                        sendGeneratedImage(wm, `\u2728 ${ANGLES[2].label} \u2014 e-commerce`).catch(e => console.error(`[${reqId}] Send band failed:`, e.message));
-                    })
-                    .catch(err => { console.error(`[${reqId}] Band failed:`, err.message); return null; }),
-                generateEcommerceShot(refsForAngles, null, ANGLES[3], ai)
-                    .then(async (b64) => {
-                        const wm = await addWatermark(b64);
-                        sendGeneratedImage(wm, `\u2728 ${ANGLES[3].label} \u2014 e-commerce`).catch(e => console.error(`[${reqId}] Send detail failed:`, e.message));
-                    })
-                    .catch(err => { console.error(`[${reqId}] Detail failed:`, err.message); return null; }),
-            ];
-
-            // If mode is 'both', also fire model shot in parallel with the 3 ecommerce angles
-            if (doModel) {
-                parallelEcom.push(
-                    generateModelShot(images, finalScene, ai)
-                        .then(async (modelB64) => {
-                            sendGeneratedImage(modelB64, `\u2728 ${label} \u2014 model shot`).catch(e => console.error(`[${reqId}] Send model failed:`, e.message));
-                        })
-                        .catch(err => { console.error(`[${reqId}] Model failed:`, err.message); return null; })
-                );
+            // If front-only ecommerce but also model shots needed, fire model shots now
+            if (ecomCount === 1 && modelCount > 0) {
+                await setStatus(from, step, `Generating ${modelCount} model shot${modelCount > 1 ? 's' : ''}`);
+                await log(`\u23f3 Step ${step}/${totalSteps} \u2014 Generating *${modelCount} model shot${modelCount > 1 ? 's' : ''}*...`);
+                const modelTasks = [];
+                for (let i = 0; i < modelCount; i++) {
+                    const shotLabel = modelCount > 1 ? `model shot ${i + 1}/${modelCount}` : 'model shot';
+                    modelTasks.push(
+                        generateModelShot(images, finalScene, ai, jewelryType)
+                            .then(async (b64) => {
+                                sendGeneratedImage(b64, `\u2728 ${label} \u2014 ${shotLabel}`).catch(e => console.error(`[${reqId}] Send model failed:`, e.message));
+                            })
+                            .catch(err => { console.error(`[${reqId}] Model ${i + 1} failed:`, err.message); return null; })
+                    );
+                }
+                await Promise.all(modelTasks);
+                await log(`\u2705 Step ${step}/${totalSteps} \u2014 Model shot${modelCount > 1 ? 's' : ''} done (${((Date.now() - startTime) / 1000).toFixed(1)}s)`);
+                step++;
             }
 
-            await Promise.all(parallelEcom);
-            await log(`\u2705 Step ${step}/${totalSteps} \u2014 All parallel shots done (${((Date.now() - startTime) / 1000).toFixed(1)}s)`);
-            step++;
-        } else {
-            // ── Model shot only (original behavior) ──
-            await setStatus(from, step, `Generating ${label} from ${images.length} angle${images.length > 1 ? 's' : ''} \u2014 this takes 1\u20135 mins`);
-            await log(`\u23f3 Step ${step}/${totalSteps} \u2014 Generating *${label}* from ${images.length} angle${images.length > 1 ? 's' : ''}...`);
-            const imageBase64 = await generateModelShot(images, finalScene, ai);
-            await log(`\u2705 Step ${step}/${totalSteps} \u2014 Done in ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
-            step++;
+            // Step: generate remaining ecommerce angles in parallel (with front as reference)
+            if (ecomCount >= 2) {
+                const frontRef = { base64: frontBase64, mimeType: 'image/png' };
+                const refsForAngles = [...images, frontRef];
 
-            await setStatus(from, step, 'Uploading generated image to WhatsApp');
-            await log(`\u23f3 Step ${step}/${totalSteps} \u2014 Uploading to WhatsApp...`);
-            const uploadedMediaId = await uploadMediaToMeta(imageBase64, phoneNumberId, secrets);
-            await log(`\u2705 Step ${step}/${totalSteps} \u2014 Uploaded`);
-            step++;
+                const parallelNames = [];
+                const parallelEcom = [];
 
-            await setStatus(from, step, 'Sending image to you');
-            await log(`\u23f3 Step ${step}/${totalSteps} \u2014 Sending your image...`);
-            await sendImage(from, uploadedMediaId, `\u2728 ${label} \u2014 generated with Gemini`, secrets);
-            step++;
+                // Elevated (3/4 view) — included when ecomCount >= 2
+                parallelNames.push('Elevated');
+                parallelEcom.push(
+                    generateEcommerceShot(refsForAngles, null, ANGLES[1], ai, jewelryType)
+                        .then(async (b64) => {
+                            sendGeneratedImage(b64, `\u2728 ${ANGLES[1].label} \u2014 e-commerce`).catch(e => console.error(`[${reqId}] Send elevated failed:`, e.message));
+                        })
+                        .catch(err => { console.error(`[${reqId}] Elevated failed:`, err.message); return null; }),
+                );
+
+                // Detail close-up — included when ecomCount >= 3
+                if (ecomCount >= 3) {
+                    parallelNames.push('Detail');
+                    parallelEcom.push(
+                        generateEcommerceShot(refsForAngles, null, ANGLES[3], ai, jewelryType)
+                            .then(async (b64) => {
+                                sendGeneratedImage(b64, `\u2728 ${ANGLES[3].label} \u2014 e-commerce`).catch(e => console.error(`[${reqId}] Send detail failed:`, e.message));
+                            })
+                            .catch(err => { console.error(`[${reqId}] Detail failed:`, err.message); return null; }),
+                    );
+                }
+
+                // Band shot — only for rings/bracelets when ecomCount >= 4
+                if (doBand) {
+                    parallelNames.push('Band');
+                    parallelEcom.push(
+                        generateEcommerceShot(refsForAngles, null, ANGLES[2], ai, jewelryType)
+                            .then(async (b64) => {
+                                sendGeneratedImage(b64, `\u2728 ${ANGLES[2].label} \u2014 e-commerce`).catch(e => console.error(`[${reqId}] Send band failed:`, e.message));
+                            })
+                            .catch(err => { console.error(`[${reqId}] Band failed:`, err.message); return null; })
+                    );
+                }
+
+                // Model shots in parallel with ecommerce (for "both" mode)
+                for (let i = 0; i < modelCount; i++) {
+                    const shotLabel = modelCount > 1 ? `model shot ${i + 1}/${modelCount}` : 'model shot';
+                    parallelEcom.push(
+                        generateModelShot(images, finalScene, ai, jewelryType)
+                            .then(async (modelB64) => {
+                                sendGeneratedImage(modelB64, `\u2728 ${label} \u2014 ${shotLabel}`).catch(e => console.error(`[${reqId}] Send model failed:`, e.message));
+                            })
+                            .catch(err => { console.error(`[${reqId}] Model ${i + 1} failed:`, err.message); return null; })
+                    );
+                }
+
+                const parallelLabel = parallelNames.join(' + ');
+                await setStatus(from, step, `Generating ${parallelLabel}${modelCount > 0 ? ' + Model' : ''} in parallel`);
+                await log(`\u23f3 Step ${step}/${totalSteps} \u2014 Generating *${parallelLabel}${modelCount > 0 ? ' + Model' : ''}* in parallel...`);
+                await Promise.all(parallelEcom);
+                await log(`\u2705 Step ${step}/${totalSteps} \u2014 All parallel shots done (${((Date.now() - startTime) / 1000).toFixed(1)}s)`);
+                step++;
+            }
+        } else if (modelCount > 0) {
+            // ── Model shot(s) only (no ecommerce) ──
+            if (modelCount === 1) {
+                await setStatus(from, step, `Generating ${label} from ${images.length} angle${images.length > 1 ? 's' : ''} \u2014 this takes 1\u20135 mins`);
+                await log(`\u23f3 Step ${step}/${totalSteps} \u2014 Generating *${label}* from ${images.length} angle${images.length > 1 ? 's' : ''}...`);
+                const imageBase64 = await generateModelShot(images, finalScene, ai, jewelryType);
+                sendGeneratedImage(imageBase64, `\u2728 ${label} \u2014 model shot`).catch(e => console.error(`[${reqId}] Send model failed:`, e.message));
+                await log(`\u2705 Step ${step}/${totalSteps} \u2014 Done in ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
+                step++;
+            } else {
+                await setStatus(from, step, `Generating ${modelCount} model shots in parallel`);
+                await log(`\u23f3 Step ${step}/${totalSteps} \u2014 Generating *${modelCount} model shots* in parallel...`);
+                const modelTasks = [];
+                for (let i = 0; i < modelCount; i++) {
+                    const shotLabel = `model shot ${i + 1}/${modelCount}`;
+                    modelTasks.push(
+                        generateModelShot(images, finalScene, ai, jewelryType)
+                            .then(async (b64) => {
+                                sendGeneratedImage(b64, `\u2728 ${label} \u2014 ${shotLabel}`).catch(e => console.error(`[${reqId}] Send model ${i + 1} failed:`, e.message));
+                            })
+                            .catch(err => { console.error(`[${reqId}] Model ${i + 1} failed:`, err.message); return null; })
+                    );
+                }
+                await Promise.all(modelTasks);
+                await log(`\u2705 Step ${step}/${totalSteps} \u2014 All ${modelCount} model shots done (${((Date.now() - startTime) / 1000).toFixed(1)}s)`);
+                step++;
+            }
         }
 
         // Auto-write product copy for every generated output, based on the same reference photos.
@@ -934,12 +999,14 @@ async function processImages(mediaIds, scene, label, from, phoneNumberId, secret
         if (shouldStartNext) {
             const session = await getSession(from).catch(() => null);
             if (session?.mediaIds?.length) {
-                const { mediaIds, scene: nextScene } = session;
-                const nextLabel = getSceneLabel(nextScene);
+                const { mediaIds, scene: nextScene, jewelryType: jt, outputType: ot, angleConfig: ac } = session;
+                let finalNextScene = nextScene || SCENES.model;
+                if (jt) finalNextScene = finalNextScene.replace(/the jewelry/gi, `the ${jt}`);
+                const nextLabel = getSceneLabel(finalNextScene);
                 await clearSession(from).catch(() => {});
                 const nextReqId = Math.random().toString(36).slice(2, 8).toUpperCase();
                 console.log(`[${reqId}] Starting queued next batch \u2014 ${mediaIds.length} image(s)`);
-                await processImages(mediaIds, nextScene, nextLabel, from, phoneNumberId, secrets, ai, nextReqId);
+                await processImages(mediaIds, finalNextScene, nextLabel, from, phoneNumberId, secrets, ai, nextReqId, ot || 'model', jt, ac);
             }
         }
     }
@@ -948,6 +1015,7 @@ async function processImages(mediaIds, scene, label, from, phoneNumberId, secret
 // ── Message handler ────────────────────────────────────────────────────────────
 async function handleMessage(msg, phoneNumberId, secrets, ai, reqId) {
     const from = msg.from;
+    const _t0 = Date.now();
     console.log(`[${reqId}] From: ${from} | Type: ${msg.type}`);
 
     // ── Interactive replies (button taps & list selections) ──
@@ -961,29 +1029,37 @@ async function handleMessage(msg, phoneNumberId, secrets, ai, reqId) {
         // ── Main menu flow selections ──
         // "Put Jewellery on Model" → show jewelry type sub-menu
         if (replyId === 'flow_model') {
-            await setFlowState(from, 'picking_jewelry', SCENES.model, undefined, 'model');
-            await sendJewelryTypeMenu(from, secrets);
+            await Promise.all([
+                setFlowState(from, 'picking_jewelry', SCENES.model, undefined, 'model'),
+                sendJewelryTypeMenu(from, secrets),
+            ]);
             return;
         }
 
-        // "E-commerce Shots" → ask for image directly
+        // "E-commerce Shots" → show jewelry type sub-menu
         if (replyId === 'flow_ecommerce') {
-            await setFlowState(from, 'awaiting_image', SCENES.model, undefined, 'ecommerce');
-            await sendText(from, secrets, 'Please upload an image to continue \ud83d\udd17\ud83d\udcf8\n\n_Mode: 4 e-commerce product angles_');
+            await Promise.all([
+                setFlowState(from, 'picking_jewelry', SCENES.model, undefined, 'ecommerce'),
+                sendJewelryTypeMenu(from, secrets),
+            ]);
             return;
         }
 
-        // "Model + E-commerce" → ask for image directly
+        // "Model + E-commerce" → show jewelry type sub-menu
         if (replyId === 'flow_both') {
-            await setFlowState(from, 'awaiting_image', SCENES.model, undefined, 'both');
-            await sendText(from, secrets, 'Please upload an image to continue \ud83d\udd17\ud83d\udcf8\n\n_Mode: Model shot + 4 e-commerce angles (5 images total)_');
+            await Promise.all([
+                setFlowState(from, 'picking_jewelry', SCENES.model, undefined, 'both'),
+                sendJewelryTypeMenu(from, secrets),
+            ]);
             return;
         }
 
         // "Give your own prompt" → ask for prompt text
         if (replyId === 'flow_custom') {
-            await setFlowState(from, 'awaiting_prompt', undefined, undefined);
-            await sendText(from, secrets, 'Type your scene description below.\n\nExample: _on a velvet cushion with rose petals and warm candlelight_');
+            await Promise.all([
+                setFlowState(from, 'awaiting_prompt', undefined, undefined),
+                sendText(from, secrets, 'Type your scene description below.\n\nExample: _on a velvet cushion with rose petals and warm candlelight_'),
+            ]);
             return;
         }
 
@@ -1017,15 +1093,179 @@ async function handleMessage(msg, phoneNumberId, secrets, ai, reqId) {
                 jewel_brooch:   'brooch',
             };
             const jewelryType = typeMap[replyId] || 'jewelry';
-            await setFlowState(from, 'awaiting_image', undefined, jewelryType);
-            await sendText(from, secrets, `Please upload an image to continue 🔗📸\n\n_Jewellery: ${jewelryType}_`);
+            const existingSession = await getSession(from);
+            const ot = existingSession?.outputType || 'model';
+            const hasBand = jewelryType === 'ring' || jewelryType === 'bracelet';
+
+            // Show angle/count selection based on mode
+            if (ot === 'ecommerce') {
+                const buttons = hasBand
+                    ? [
+                        { id: 'ang_ecom_all',  title: `All Angles (4)` },
+                        { id: 'ang_ecom_2',    title: 'Front + 3/4 (2)' },
+                        { id: 'ang_ecom_1',    title: 'Front Only (1)' },
+                    ]
+                    : [
+                        { id: 'ang_ecom_all',  title: `All Angles (3)` },
+                        { id: 'ang_ecom_2',    title: 'Front + 3/4 (2)' },
+                        { id: 'ang_ecom_1',    title: 'Front Only (1)' },
+                    ];
+                await Promise.all([
+                    setFlowState(from, 'picking_angles', undefined, jewelryType),
+                    sendButtons(from, secrets, `How many e-commerce angles?\n\n💍 *${jewelryType}*`, buttons),
+                ]);
+            } else if (ot === 'model') {
+                await Promise.all([
+                    setFlowState(from, 'picking_angles', undefined, jewelryType),
+                    sendButtons(from, secrets, `How many model shots?\n\n💍 *${jewelryType}*`, [
+                        { id: 'ang_model_1', title: '1 Shot' },
+                        { id: 'ang_model_2', title: '2 Shots' },
+                        { id: 'ang_model_3', title: '3 Shots' },
+                    ]),
+                ]);
+            } else {
+                // "both" mode
+                const allCount = hasBand ? 5 : 4;
+                await Promise.all([
+                    setFlowState(from, 'picking_angles', undefined, jewelryType),
+                    sendButtons(from, secrets, `How many images?\n\n💍 *${jewelryType}*`, [
+                        { id: 'ang_both_full',  title: `Full Set (${allCount})` },
+                        { id: 'ang_both_quick', title: 'Quick (3)' },
+                        { id: 'ang_both_min',   title: 'Minimal (2)' },
+                    ]),
+                ]);
+            }
+            return;
+        }
+
+        // ── Angle/count selection ──
+        if (replyId?.startsWith('ang_')) {
+            const session = await getSession(from);
+            const ot = session?.outputType || 'model';
+            const jt = session?.jewelryType || 'jewelry';
+            const modeLabel = ot === 'both' ? 'Model + E-commerce'
+                : ot === 'ecommerce' ? 'E-commerce Shots'
+                : 'Model Shot';
+
+            // Parse angle config from button ID
+            let angleConfig;
+            if (replyId === 'ang_ecom_all')       angleConfig = { ecom: 'all', model: 0 };
+            else if (replyId === 'ang_ecom_2')    angleConfig = { ecom: 2, model: 0 };
+            else if (replyId === 'ang_ecom_1')    angleConfig = { ecom: 1, model: 0 };
+            else if (replyId === 'ang_model_1')   angleConfig = { ecom: 0, model: 1 };
+            else if (replyId === 'ang_model_2')   angleConfig = { ecom: 0, model: 2 };
+            else if (replyId === 'ang_model_3')   angleConfig = { ecom: 0, model: 3 };
+            else if (replyId === 'ang_both_full') angleConfig = { ecom: 'all', model: 1 };
+            else if (replyId === 'ang_both_quick') angleConfig = { ecom: 2, model: 1 };
+            else if (replyId === 'ang_both_min')  angleConfig = { ecom: 1, model: 1 };
+            else angleConfig = { ecom: 'all', model: 1 };
+
+            const countLabel = [];
+            if (angleConfig.ecom === 'all') countLabel.push('all e-commerce angles');
+            else if (angleConfig.ecom > 0) countLabel.push(`${angleConfig.ecom} e-commerce angle${angleConfig.ecom > 1 ? 's' : ''}`);
+            if (angleConfig.model > 0) countLabel.push(`${angleConfig.model} model shot${angleConfig.model > 1 ? 's' : ''}`);
+
+            await Promise.all([
+                setFlowState(from, 'awaiting_image', undefined, undefined, undefined, { angleConfig }),
+                sendText(from, secrets, `📸 Upload your photos now!\n\n_Mode: ${modeLabel}_\n_Jewellery: ${jt}_\n_Output: ${countLabel.join(' + ')}_`),
+            ]);
+            return;
+        }
+
+        // ── Standalone: Change Stone Color flow ──
+        if (replyId === 'flow_stone') {
+            await Promise.all([
+                setFlowState(from, 'picking_stone', undefined, undefined, 'stone_swap'),
+                sendList(from, secrets,
+                    'Pick the new stone color:',
+                    'Stone Color',
+                    [{
+                        title: 'Stone Color',
+                        rows: [
+                            { id: 'stone_diamond',  title: 'Diamond (White)',   description: 'Clear / colorless' },
+                            { id: 'stone_blue',     title: 'Blue Sapphire',     description: 'Deep royal blue' },
+                            { id: 'stone_ruby',     title: 'Ruby Red',          description: 'Vivid red' },
+                            { id: 'stone_emerald',  title: 'Emerald Green',     description: 'Rich green' },
+                            { id: 'stone_pink',     title: 'Pink Sapphire',     description: 'Soft pink' },
+                            { id: 'stone_yellow',   title: 'Yellow / Canary',   description: 'Fancy yellow diamond' },
+                            { id: 'stone_purple',   title: 'Amethyst Purple',   description: 'Deep purple' },
+                            { id: 'stone_black',    title: 'Black Onyx',        description: 'Jet black stone' },
+                            { id: 'stone_aqua',     title: 'Aquamarine',        description: 'Light blue-green' },
+                        ],
+                    }],
+                ),
+            ]);
+            return;
+        }
+
+        // ── Standalone: Change Metal Color flow ──
+        if (replyId === 'flow_metal') {
+            await Promise.all([
+                setFlowState(from, 'picking_metal', undefined, undefined, 'metal_swap'),
+                sendList(from, secrets,
+                    'Pick the new metal color:',
+                    'Metal Color',
+                    [{
+                        title: 'Metal Color',
+                        rows: [
+                            { id: 'metal_yellow',   title: 'Yellow Gold',      description: 'Classic warm gold' },
+                            { id: 'metal_white',    title: 'White Gold',       description: 'Silvery white gold' },
+                            { id: 'metal_rose',     title: 'Rose Gold',        description: 'Pink-toned gold' },
+                            { id: 'metal_platinum', title: 'Platinum',         description: 'Cool silver-white' },
+                            { id: 'metal_silver',   title: 'Sterling Silver',  description: 'Bright silver' },
+                            { id: 'metal_twotone',  title: 'Two-Tone',        description: 'Yellow + white gold' },
+                        ],
+                    }],
+                ),
+            ]);
+            return;
+        }
+
+        // ── Stone color picked (standalone) ──
+        if (replyId?.startsWith('stone_')) {
+            const stoneMap = {
+                stone_diamond:  'diamond (white/colorless)',
+                stone_blue:     'blue sapphire',
+                stone_ruby:     'ruby red',
+                stone_emerald:  'emerald green',
+                stone_pink:     'pink sapphire',
+                stone_yellow:   'fancy yellow diamond',
+                stone_purple:   'amethyst purple',
+                stone_black:    'black onyx',
+                stone_aqua:     'aquamarine',
+            };
+            const stoneColor = stoneMap[replyId] || replyId.replace('stone_', '');
+            await Promise.all([
+                setFlowState(from, 'awaiting_image', undefined, undefined, undefined, { stoneColor }),
+                sendText(from, secrets, `💎 Stone → *${stoneColor}*\n\n📸 Send your jewelry photo now.`),
+            ]);
+            return;
+        }
+
+        // ── Metal color picked (standalone) ──
+        if (replyId?.startsWith('metal_')) {
+            const metalMap = {
+                metal_yellow:   'yellow gold',
+                metal_white:    'white gold',
+                metal_rose:     'rose gold',
+                metal_platinum: 'platinum',
+                metal_silver:   'sterling silver',
+                metal_twotone:  'two-tone (yellow and white gold)',
+            };
+            const metalColor = metalMap[replyId] || replyId.replace('metal_', '');
+            await Promise.all([
+                setFlowState(from, 'awaiting_image', undefined, undefined, undefined, { metalColor }),
+                sendText(from, secrets, `🪙 Metal → *${metalColor}*\n\n📸 Send your jewelry photo now.`),
+            ]);
             return;
         }
 
         // "Go Back" → main menu
         if (replyId === 'menu_goback') {
-            await clearFlowState(from);
-            await sendMainMenu(from, secrets);
+            await Promise.all([
+                clearFlowState(from),
+                sendMainMenu(from, secrets),
+            ]);
             return;
         }
 
@@ -1056,16 +1296,21 @@ async function handleMessage(msg, phoneNumberId, secrets, ai, reqId) {
             if (age > QUEUE_WARN_MS) {
                 await sendText(from, secrets, '⚠️ Images are >30 min old — they may have expired. Attempting anyway...');
             }
-            const { mediaIds, scene } = session;
-            const label = getSceneLabel(scene);
+            const { mediaIds, scene, jewelryType: jt, outputType: ot, angleConfig: ac } = session;
+            let finalScene = scene || SCENES.model;
+            if (jt) finalScene = finalScene.replace(/the jewelry/gi, `the ${jt}`);
+            const label = getSceneLabel(finalScene);
             await clearSession(from);
-            await processImages(mediaIds, scene, label, from, phoneNumberId, secrets, ai, reqId);
+            await processImages(mediaIds, finalScene, label, from, phoneNumberId, secrets, ai, reqId, ot || 'model', jt, ac);
             return;
         }
 
         if (replyId === 'btn_cancel') {
-            await Promise.all([clearSession(from), clearPendingDone(from)]);
-            await sendText(from, secrets, '🗑️ Queue cleared.');
+            await Promise.all([
+                clearSession(from),
+                clearPendingDone(from),
+                sendText(from, secrets, '🗑️ Queue cleared.'),
+            ]);
             await sendMainMenu(from, secrets);
             return;
         }
@@ -1081,7 +1326,7 @@ async function handleMessage(msg, phoneNumberId, secrets, ai, reqId) {
                 await sendMainMenu(from, secrets);
                 return;
             }
-            await processImages(job.mediaIds, job.scene, job.label, from, phoneNumberId, secrets, ai, reqId);
+            await processImages(job.mediaIds, job.scene, job.label, from, phoneNumberId, secrets, ai, reqId, job.outputType, job.jewelryType, job.angleConfig);
             return;
         }
 
@@ -1153,19 +1398,26 @@ async function handleMessage(msg, phoneNumberId, secrets, ai, reqId) {
         const userText = msg.text?.body?.trim() || '';
         const lower = userText.toLowerCase();
 
-        // Check flow state — if user is mid-flow, intercept their text
-        const flowSession = await getSession(from);
-        if (flowSession?.flowState === 'awaiting_prompt' && userText && !['help','hi','menu','start','cancel','clear','reset'].includes(lower)) {
-            // User typed their custom scene description
-            const { scene } = resolveScene(userText);
-            await setFlowState(from, 'awaiting_image', scene, flowSession.jewelryType);
-            await sendText(from, secrets, `Please upload an image to continue 🔗📸\n\n_Scene: ${userText}_`);
+        // Fast path — known menu commands skip session read entirely
+        if (!userText || lower === 'help' || lower === 'hi' || lower === 'menu' || lower === 'start') {
+            const _t1 = Date.now();
+            await Promise.all([
+                clearFlowState(from).catch(() => {}),
+                sendMainMenu(from, secrets),
+            ]);
+            console.log(`[${reqId}] Menu sent in ${Date.now() - _t1}ms (total ${Date.now() - _t0}ms)`);
             return;
         }
 
-        if (!userText || lower === 'help' || lower === 'hi' || lower === 'menu' || lower === 'start') {
-            await clearFlowState(from).catch(() => {});
-            await sendMainMenu(from, secrets);
+        // Check flow state — if user is mid-flow, intercept their text
+        const flowSession = await getSession(from);
+        if (flowSession?.flowState === 'awaiting_prompt' && userText && !['cancel','clear','reset'].includes(lower)) {
+            // User typed their custom scene description
+            const { scene } = resolveScene(userText);
+            await Promise.all([
+                setFlowState(from, 'awaiting_image', scene, flowSession.jewelryType),
+                sendText(from, secrets, `Please upload an image to continue 🔗📸\n\n_Scene: ${userText}_`),
+            ]);
             return;
         }
 
@@ -1290,10 +1542,12 @@ async function handleMessage(msg, phoneNumberId, secrets, ai, reqId) {
             if (age > QUEUE_WARN_MS) {
                 await sendText(from, secrets, '⚠️ Images are >30 min old — they may have expired. Attempting anyway...');
             }
-            const { mediaIds, scene } = session;
-            const label = getSceneLabel(scene);
+            const { mediaIds, scene, jewelryType: jt, outputType: ot, angleConfig: ac } = session;
+            let finalScene = scene || SCENES.model;
+            if (jt) finalScene = finalScene.replace(/the jewelry/gi, `the ${jt}`);
+            const label = getSceneLabel(finalScene);
             await clearSession(from);
-            await processImages(mediaIds, scene, label, from, phoneNumberId, secrets, ai, reqId);
+            await processImages(mediaIds, finalScene, label, from, phoneNumberId, secrets, ai, reqId, ot || 'model', jt, ac);
             return;
         }
 
@@ -1308,7 +1562,7 @@ async function handleMessage(msg, phoneNumberId, secrets, ai, reqId) {
                 await sendText(from, secrets, '🤷 No failed job to retry. Send images and type *done* to generate.');
                 return;
             }
-            await processImages(job.mediaIds, job.scene, job.label, from, phoneNumberId, secrets, ai, reqId);
+            await processImages(job.mediaIds, job.scene, job.label, from, phoneNumberId, secrets, ai, reqId, job.outputType, job.jewelryType, job.angleConfig);
             return;
         }
 
@@ -1367,26 +1621,102 @@ async function handleMessage(msg, phoneNumberId, secrets, ai, reqId) {
     const mediaId = msg.image.id;
     const caption = (msg.image.caption || '').trim() || null;
 
-    // ── Flow-driven: user came through the menu flow → auto-process immediately ──
+    // ── Flow-driven: user came through the menu flow ──
     const imgSession = await getSession(from);
-    if (imgSession?.flowState === 'awaiting_image') {
-        const scene = imgSession.scene || SCENES.model;
-        const label = getSceneLabel(scene);
-        const jewelryType = imgSession.jewelryType;
-        const sessionOutputType = imgSession.outputType || 'model';
-        await clearSession(from);
 
-        const modeLabel = sessionOutputType === 'both' ? 'model + 4 e-commerce angles'
-            : sessionOutputType === 'ecommerce' ? '4 e-commerce angles'
-            : label;
-        await sendText(from, secrets, `Processing your image \u2728\n\n_Mode: ${modeLabel}_\nPlease wait for the magic to happen \u23f3`);
+    // ── Standalone color swap: process immediately, no queue ──
+    if (imgSession?.flowState === 'awaiting_image' && (imgSession.outputType === 'stone_swap' || imgSession.outputType === 'metal_swap')) {
+        const swapStone = imgSession.stoneColor || null;
+        const swapMetal = imgSession.metalColor || null;
+        await clearFlowState(from);
+        await sendText(from, secrets, `⏳ Processing color change...`);
+        try {
+            const image = await downloadWhatsAppMedia(mediaId, secrets);
+            const colorParts = [];
+            if (swapStone) colorParts.push(`Change the stone/gem color to ${swapStone}. The new stone must look natural and realistic with correct refraction, inclusions, and color saturation for that gem type.`);
+            if (swapMetal) colorParts.push(`Change the metal to ${swapMetal}. The new metal must have the correct luster, reflectivity, and color tone for ${swapMetal}.`);
+            const colorPrompt = [
+                'You are a professional jewelry retoucher.',
+                'Use the uploaded image as the EXACT reference.',
+                '',
+                'TASK: Generate a new version of this exact jewelry piece with the following color change(s) applied. Keep EVERYTHING else identical — shape, design, setting, proportions, camera angle, lighting, background. Only change the specified color(s).',
+                '',
+                ...colorParts,
+                '',
+                'FIDELITY: Reproduce every detail — prong count, setting style, engraving, filigree, stone cut, facet count. The ONLY difference from the original should be the color change(s) specified above.',
+                '',
+                'OUTPUT: Same framing, angle, and background as the input image. Professional e-commerce quality. Square 1:1.',
+            ].join('\n');
 
-        // If a jewelry type was selected, inject it into the scene prompt
-        let finalScene = scene;
-        if (jewelryType) {
-            finalScene = scene.replace(/the jewelry/gi, `the ${jewelryType}`);
+            const parts = [
+                { inlineData: { mimeType: image.mimeType, data: image.base64 } },
+                { text: colorPrompt },
+            ];
+            const result = await callGemini(parts, ai);
+            const uploaded = await uploadMediaToMeta(result, phoneNumberId, secrets);
+            const changeLabel = [swapStone ? `stone → ${swapStone}` : '', swapMetal ? `metal → ${swapMetal}` : ''].filter(Boolean).join(', ');
+            await sendImage(from, uploaded, `✨ Color swap: ${changeLabel}`, secrets);
+            await sendButtons(from, secrets, 'What next?', [
+                { id: 'btn_new', title: '📸 New Photo' },
+                { id: 'btn_help', title: '📋 Menu' },
+            ]);
+        } catch (err) {
+            console.error(`[${reqId}] Color swap failed:`, err.message);
+            await sendText(from, secrets, `❌ Color swap failed: ${err.message}`);
+            await sendMainMenu(from, secrets);
         }
-        await processImages([mediaId], finalScene, label, from, phoneNumberId, secrets, ai, reqId, sessionOutputType);
+        return;
+    }
+
+    if (imgSession?.flowState === 'awaiting_image') {
+        // Queue into existing session (preserves scene, jewelryType, outputType)
+        const { count, sceneLabel } = await addMediaIdToSession(from, mediaId, caption);
+        const sessionOutputType = imgSession.outputType || 'model';
+        const modeLabel = sessionOutputType === 'both' ? 'Model + E-commerce'
+            : sessionOutputType === 'ecommerce' ? 'E-commerce Shots'
+            : 'Model Shot';
+        const acInfo = imgSession.angleConfig;
+        const acParts = [];
+        if (acInfo?.ecom === 'all') acParts.push('all e-com angles');
+        else if (acInfo?.ecom > 0) acParts.push(`${acInfo.ecom} e-com angle${acInfo.ecom > 1 ? 's' : ''}`);
+        if (acInfo?.model > 0) acParts.push(`${acInfo.model} model shot${acInfo.model > 1 ? 's' : ''}`);
+        const acLabel = acParts.length ? `\n📐 Output: *${acParts.join(' + ')}*` : '';
+        await sendButtons(
+            from, secrets,
+            `📸 *Photo ${count} queued*\n🎬 Mode: *${modeLabel}*${imgSession.jewelryType ? `\n💍 Type: *${imgSession.jewelryType}*` : ''}${acLabel}\n\nSend more angles or tap Generate.`,
+            [
+                { id: 'btn_done',   title: '✅ Generate' },
+                { id: 'btn_cancel', title: '🗑️ Cancel' },
+            ],
+        );
+        console.log(`[${reqId}] Flow image ${count} queued for ${from} (mode: ${sessionOutputType})`);
+
+        // If user already typed "done" before images landed, auto-trigger
+        const claimed = await claimPendingDone(from);
+        if (claimed) {
+            if (await isGenerating(from)) {
+                await setPendingNext(from);
+                return;
+            }
+            let prevCount = count;
+            let stableRounds = 0;
+            for (let i = 0; i < 15 && stableRounds < 2; i++) {
+                await new Promise(r => setTimeout(r, 1000));
+                const s = await getSession(from);
+                const c = s?.mediaIds?.length || 0;
+                if (c > 0 && c === prevCount) stableRounds++;
+                else { stableRounds = 0; prevCount = c; }
+            }
+            const session = await getSession(from);
+            if (session?.mediaIds?.length) {
+                const { mediaIds: ids, scene: sc, jewelryType: jt, outputType: ot, angleConfig: ac } = session;
+                let finalScene = sc || SCENES.model;
+                if (jt) finalScene = finalScene.replace(/the jewelry/gi, `the ${jt}`);
+                const lbl = getSceneLabel(finalScene);
+                await clearSession(from);
+                await processImages(ids, finalScene, lbl, from, phoneNumberId, secrets, ai, reqId, ot || 'model', jt, ac);
+            }
+        }
         return;
     }
 
@@ -1450,11 +1780,13 @@ async function handleMessage(msg, phoneNumberId, secrets, ai, reqId) {
             }
             const session = await getSession(from);
             if (session?.mediaIds?.length) {
-                const { mediaIds, scene } = session;
-                const label = getSceneLabel(scene);
+                const { mediaIds, scene, jewelryType: jt, outputType: ot, angleConfig: ac } = session;
+                let finalScene = scene || SCENES.model;
+                if (jt) finalScene = finalScene.replace(/the jewelry/gi, `the ${jt}`);
+                const label = getSceneLabel(finalScene);
                 await clearSession(from);
                 console.log(`[${reqId}] Auto-triggering from pending_done — ${mediaIds.length} image(s)`);
-                await processImages(mediaIds, scene, label, from, phoneNumberId, secrets, ai, reqId);
+                await processImages(mediaIds, finalScene, label, from, phoneNumberId, secrets, ai, reqId, ot || 'model', jt, ac);
             }
         }
     } catch (err) {
@@ -1537,6 +1869,7 @@ async function sendButtons(to, secrets, body, buttons, header, footer) {
 }
 
 async function sendList(to, secrets, body, buttonText, sections, header, footer) {
+    const _t = Date.now();
     const interactive = {
         type: 'list',
         body: { text: body },
@@ -1552,6 +1885,7 @@ async function sendList(to, secrets, body, buttonText, sections, header, footer)
         { messaging_product: 'whatsapp', to, type: 'interactive', interactive },
         { headers: { Authorization: `Bearer ${secrets.whatsappToken}`, 'Content-Type': 'application/json' } }
     );
+    console.log(`[sendList] WhatsApp API took ${Date.now() - _t}ms`);
 }
 
 // ── Menu flows (Jewel IA-style multi-step menus) ────────────────────────────
@@ -1567,6 +1901,8 @@ async function sendMainMenu(to, secrets) {
                 { id: 'flow_ecommerce',  title: 'E-commerce Shots',       description: '4 professional product angles' },
                 { id: 'flow_both',       title: 'Model + E-commerce',     description: 'All 5 shots (model + 4 angles)' },
                 { id: 'flow_custom',     title: 'Give Your Own Prompt',   description: 'Describe any custom scene' },
+                { id: 'flow_stone',      title: 'Change Stone Color',     description: 'Swap gem/stone to a new color' },
+                { id: 'flow_metal',      title: 'Change Metal Color',    description: 'Swap metal to gold, silver, etc.' },
                 { id: 'flow_desc',       title: 'Product Description',    description: 'Generate WhatsApp product copy' },
                 { id: 'flow_bulk',       title: 'Bulk Generation',        description: 'Queue multiple images at once' },
                 { id: 'flow_status',     title: 'Check Status',           description: 'See queue & generation progress' },
@@ -1679,7 +2015,7 @@ Meet your new obsession. *A certified yellow sapphire. Brilliant zircon accents.
 }
 
 // ── Generate model shot from one or more jewelry images ───────────────────────
-async function generateModelShot(images, scene, ai) {
+async function generateModelShot(images, scene, ai, jewelryType) {
     const sceneInstruction = scene
         ? scene
         : 'Show the jewelry worn on a woman\'s hand \u2014 tight close-up cropped to ONLY the hand and wrist. No face, no body, no neck, no full arm. Just the hand. Natural, elegant hand with relaxed fingers in a graceful pose. Single soft key light from camera-left. Shallow depth of field with the jewelry in razor-sharp focus and the background gently blurred. Square 1:1 crop.';
@@ -1688,9 +2024,14 @@ async function generateModelShot(images, scene, ai) {
         ? `You have ${images.length} reference photos of the jewelry piece from different angles. Study ALL of them to build a complete understanding of the piece before generating.`
         : 'You have been given one reference photo of the jewelry piece.';
 
+    const earringPairNote = jewelryType === 'earrings'
+        ? 'EARRING PAIR: If the reference shows only a single earring, the model must be wearing a matching symmetrical pair — one on each ear (or both visible if the pose allows).'
+        : '';
+
     const prompt = [
         'You are simulating a photograph taken by a professional jewelry photographer.',
         refNote,
+        ...(earringPairNote ? [earringPairNote] : []),
         '',
         'CRITICAL \u2014 reproduce the jewelry with absolute fidelity:',
         '- Every gemstone: exact color, cut style, facet count, number of stones, their arrangement and size ratios',
@@ -1782,7 +2123,7 @@ async function generateModelShot(images, scene, ai) {
             });
             const parts = response.candidates?.[0]?.content?.parts || [];
             const imagePart = parts.find(p => p.inlineData?.data && !p.thought);
-            if (imagePart) return addWatermark(imagePart.inlineData.data);
+            if (imagePart) return imagePart.inlineData.data;
             console.log(`[Gemini] No image on attempt ${attempt} \u2014 retrying...`);
         } catch (err) {
             if (attempt < 2) {
